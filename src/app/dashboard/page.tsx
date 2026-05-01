@@ -268,17 +268,13 @@ export default function DashboardPage() {
                 <CardContent>
                   <pre className="bg-muted/50 p-4 rounded-lg text-sm font-mono overflow-x-auto">
                     <code>
-{`from openai import OpenAI
-
-client = OpenAI(
-    base_url="${typeof window !== 'undefined' ? window.location.origin : 'https://your-gateway.com'}/v1",
-    api_key="${apiKeys[0]?.key || 'sk-live-xxxxxxxx'}"
-)
-
-response = client.chat.completions.create(
-    model="deepseek-v3.1",
-    messages=[{"role": "user", "content": "Hello!"}]
-)`}
+{`curl ${typeof window !== 'undefined' ? window.location.origin : 'https://your-gateway.com'}/v1/chat/completions \\
+  -H "Content-Type: application/json" \\
+  -H "Authorization: Bearer ${apiKeys[0]?.key || 'sk-live-xxxxxxxx'}" \\
+  -d '{
+    "model": "deepseek-v3.1",
+    "messages": [{"role": "user", "content": "Hello!"}]
+  }'`}
                     </code>
                   </pre>
                 </CardContent>
