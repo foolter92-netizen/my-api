@@ -252,41 +252,25 @@ async function executeWithFailover(
       let errorBody = '';
       try { errorBody = await response.text(); } catch {}
 
-      // Mark key as rate limited on 429
-      if (response.status === 429) {
-        await markKeyStatus(providerKeyInfo.id, 'rate_limited', 60000);
+      // Determine if this error should trigger failover
+      // 429 = rate limit, 401 = auth/key expired, 402 = quota/balance exhausted,
+      // 403 = forbidden, 5xx = server error — all should try failover
+      const shouldFailover = [429, 401, 402, 403].includes(response.status) || response.status >= 500;
 
-        if (attemptCount < (provider.retry_attempts || 3)) {
-          const failover = await getFailoverProviderAndKey(provider.id, modelName);
-          if (failover) {
-            return executeWithFailover(
-              failover.provider, failover.key, providerRequest,
-              userId, apiKeyId, modelName, inputPrice, outputPrice, startTime, requestId, attemptCount + 1
-            );
-          }
+      if (shouldFailover) {
+        // Mark key with cooldown based on error type
+        if (response.status === 429) {
+          await markKeyStatus(providerKeyInfo.id, 'rate_limited', 60000); // 60s cooldown
+        } else if (response.status === 401 || response.status === 402) {
+          await markKeyStatus(providerKeyInfo.id, 'rate_limited', 300000); // 5min — key likely dead
+        } else {
+          await markKeyStatus(providerKeyInfo.id, 'rate_limited', 30000); // 30s cooldown
         }
 
-        await logUsage({
-          userId, apiKeyId: apiKeyId || undefined, model: modelName,
-          providerId: provider.id, providerKeyId: providerKeyInfo.id,
-          inputTokens: 0, outputTokens: 0, totalTokens: 0,
-          cost: 0, latencyMs: Date.now() - startTime,
-          status: 'rate_limited', errorMessage: 'Rate limited', requestId,
-        });
-
-        return NextResponse.json(
-          { error: { message: 'Rate limited. Please try again later.', type: 'rate_limit_error' } },
-          { status: 429 }
-        );
-      }
-
-      // Mark key on 5xx errors and try failover
-      if (response.status >= 500) {
-        await markKeyStatus(providerKeyInfo.id, 'rate_limited', 30000);
-
         if (attemptCount < (provider.retry_attempts || 3)) {
           const failover = await getFailoverProviderAndKey(provider.id, modelName);
           if (failover) {
+            console.log(`[Failover] ${provider.name} returned ${response.status}, switching to ${failover.provider.name}`);
             return executeWithFailover(
               failover.provider, failover.key, providerRequest,
               userId, apiKeyId, modelName, inputPrice, outputPrice, startTime, requestId, attemptCount + 1
@@ -295,6 +279,7 @@ async function executeWithFailover(
         }
       }
 
+      // No failover available or max attempts reached — return error to user
       // Parse error for better message
       let errorMsg = errorBody;
       try {
@@ -307,6 +292,15 @@ async function executeWithFailover(
       }
 
       console.error(`Provider error [${response.status}]: ${provider.name} - ${errorMsg}`);
+
+      // Log the failed request
+      await logUsage({
+        userId, apiKeyId: apiKeyId || undefined, model: modelName,
+        providerId: provider.id, providerKeyId: providerKeyInfo.id,
+        inputTokens: 0, outputTokens: 0, totalTokens: 0,
+        cost: 0, latencyMs: Date.now() - startTime,
+        status: 'error', errorMessage: errorMsg, requestId,
+      });
 
       return NextResponse.json(
         { error: { message: errorMsg, type: 'provider_error', provider: provider.name, status: response.status } },
@@ -398,10 +392,20 @@ async function handleStreamRequest(
       body,
     }, provider.timeout_ms || 30000);
 
-    if (response.status === 429 || response.status >= 500) {
-      await markKeyStatus(providerKeyInfo.id, 'rate_limited', 60000);
+    // Determine if this error should trigger failover (same logic as non-streaming)
+    const shouldFailover = [429, 401, 402, 403].includes(response.status) || response.status >= 500;
+
+    if (shouldFailover && !response.ok) {
+      // Mark key with cooldown based on error type
+      if (response.status === 401 || response.status === 402) {
+        await markKeyStatus(providerKeyInfo.id, 'rate_limited', 300000); // 5min — key likely dead
+      } else {
+        await markKeyStatus(providerKeyInfo.id, 'rate_limited', 60000);
+      }
+
       const failover = await getFailoverProviderAndKey(provider.id, modelName);
       if (failover) {
+        console.log(`[Stream Failover] ${provider.name} returned ${response.status}, switching to ${failover.provider.name}`);
         return handleStreamRequest(
           failover.provider, failover.key, providerRequest,
           userId, apiKeyId, modelName, inputPrice, outputPrice, startTime, requestId
