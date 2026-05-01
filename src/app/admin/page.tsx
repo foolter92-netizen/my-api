@@ -137,19 +137,28 @@ export default function AdminPage() {
   };
 
   const saveEditModel = async (id: string) => {
-    await apiFetch('/api/admin/models', {
-      method: 'PUT',
-      body: JSON.stringify({
-        id,
-        displayName: editForm.displayName,
-        inputPricePer1m: parseFloat(editForm.inputPrice),
-        outputPricePer1m: parseFloat(editForm.outputPrice),
-        maxTokens: parseInt(editForm.maxTokens),
-        status: editForm.status,
-      }),
-    });
-    setEditingModel(null);
-    loadAdminData();
+    try {
+      const res = await apiFetch('/api/admin/models', {
+        method: 'PUT',
+        body: JSON.stringify({
+          id,
+          displayName: editForm.displayName,
+          inputPricePer1m: parseFloat(editForm.inputPrice) || 0,
+          outputPricePer1m: parseFloat(editForm.outputPrice) || 0,
+          maxTokens: parseInt(editForm.maxTokens) || 4096,
+          status: editForm.status,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        alert('Failed to save: ' + (data.error || 'Unknown error'));
+        return;
+      }
+      setEditingModel(null);
+      loadAdminData();
+    } catch (error: any) {
+      alert('Error saving model: ' + error.message);
+    }
   };
 
   const cancelEditModel = () => {
