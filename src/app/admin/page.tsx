@@ -10,7 +10,7 @@ import { Badge } from '@/components/ui/badge';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import {
   Zap, Users, Server, Key, BarChart3, Plus, Trash2, ArrowLeft,
-  Activity, DollarSign, Cpu, Shield
+  Activity, DollarSign, Cpu, Shield, Pencil, X, Check
 } from 'lucide-react';
 import { apiFetch } from '@/lib/api';
 
@@ -28,6 +28,10 @@ export default function AdminPage() {
   const [newKey, setNewKey] = useState({ providerId: '', key: '', name: '', weight: '1' });
   const [newModel, setNewModel] = useState({
     providerId: '', name: '', displayName: '', inputPrice: '0', outputPrice: '0', maxTokens: '4096'
+  });
+  const [editingModel, setEditingModel] = useState<string | null>(null);
+  const [editForm, setEditForm] = useState({
+    displayName: '', inputPrice: '0', outputPrice: '0', maxTokens: '4096', status: 'active'
   });
 
   const loadAdminData = useCallback(async () => {
@@ -119,6 +123,37 @@ export default function AdminPage() {
   const deleteProviderKey = async (id: string) => {
     await apiFetch(`/api/admin/provider-keys?id=${id}`, { method: 'DELETE' });
     loadAdminData();
+  };
+
+  const startEditModel = (model: any) => {
+    setEditingModel(model.id);
+    setEditForm({
+      displayName: model.display_name,
+      inputPrice: String(model.input_price_per_1m),
+      outputPrice: String(model.output_price_per_1m),
+      maxTokens: String(model.max_tokens),
+      status: model.status,
+    });
+  };
+
+  const saveEditModel = async (id: string) => {
+    await apiFetch('/api/admin/models', {
+      method: 'PUT',
+      body: JSON.stringify({
+        id,
+        displayName: editForm.displayName,
+        inputPricePer1m: parseFloat(editForm.inputPrice),
+        outputPricePer1m: parseFloat(editForm.outputPrice),
+        maxTokens: parseInt(editForm.maxTokens),
+        status: editForm.status,
+      }),
+    });
+    setEditingModel(null);
+    loadAdminData();
+  };
+
+  const cancelEditModel = () => {
+    setEditingModel(null);
   };
 
   const deleteModel = async (id: string) => {
@@ -472,24 +507,60 @@ export default function AdminPage() {
                 {models.map(model => (
                   <Card key={model.id}>
                     <CardContent className="pt-6">
-                      <div className="flex items-center justify-between">
-                        <div>
-                          <div className="flex items-center gap-2">
-                            <span className="font-semibold">{model.display_name}</span>
-                            <Badge variant="secondary">{model.provider_name}</Badge>
-                            <Badge variant={model.status === 'active' ? 'default' : 'destructive'}>{model.status}</Badge>
+                      {editingModel === model.id ? (
+                        /* Edit Mode */
+                        <div className="space-y-3">
+                          <div className="flex items-center justify-between mb-2">
+                            <span className="font-semibold text-primary">Editing: {model.name}</span>
+                            <div className="flex gap-1">
+                              <Button variant="ghost" size="sm" className="text-green-600 h-7 w-7 p-0" onClick={() => saveEditModel(model.id)}>
+                                <Check className="h-4 w-4" />
+                              </Button>
+                              <Button variant="ghost" size="sm" className="text-muted-foreground h-7 w-7 p-0" onClick={cancelEditModel}>
+                                <X className="h-4 w-4" />
+                              </Button>
+                            </div>
                           </div>
-                          <p className="text-sm font-mono text-muted-foreground">{model.name}</p>
-                          <div className="flex gap-4 mt-1 text-sm text-muted-foreground">
-                            <span>In: ${model.input_price_per_1m}/1M</span>
-                            <span>Out: ${model.output_price_per_1m}/1M</span>
-                            <span>Max: {model.max_tokens?.toLocaleString()}</span>
+                          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-3">
+                            <Input placeholder="Display Name" value={editForm.displayName} onChange={e => setEditForm(f => ({ ...f, displayName: e.target.value }))} />
+                            <Input placeholder="Input Price / 1M" type="number" step="0.01" value={editForm.inputPrice} onChange={e => setEditForm(f => ({ ...f, inputPrice: e.target.value }))} />
+                            <Input placeholder="Output Price / 1M" type="number" step="0.01" value={editForm.outputPrice} onChange={e => setEditForm(f => ({ ...f, outputPrice: e.target.value }))} />
+                            <Input placeholder="Max Tokens" type="number" value={editForm.maxTokens} onChange={e => setEditForm(f => ({ ...f, maxTokens: e.target.value }))} />
+                            <Select value={editForm.status} onValueChange={v => setEditForm(f => ({ ...f, status: v }))}>
+                              <SelectTrigger><SelectValue /></SelectTrigger>
+                              <SelectContent>
+                                <SelectItem value="active">Active</SelectItem>
+                                <SelectItem value="inactive">Inactive</SelectItem>
+                              </SelectContent>
+                            </Select>
                           </div>
                         </div>
-                        <Button variant="ghost" size="sm" className="text-red-500" onClick={() => deleteModel(model.id)}>
-                          <Trash2 className="h-4 w-4" />
-                        </Button>
-                      </div>
+                      ) : (
+                        /* View Mode */
+                        <div className="flex items-center justify-between">
+                          <div>
+                            <div className="flex items-center gap-2">
+                              <span className="font-semibold">{model.display_name}</span>
+                              <Badge variant="secondary">{model.provider_name}</Badge>
+                              <Badge variant={model.status === 'active' ? 'default' : 'destructive'}>{model.status}</Badge>
+                            </div>
+                            <p className="text-sm font-mono text-muted-foreground">{model.name}</p>
+                            <div className="flex gap-4 mt-1 text-sm text-muted-foreground">
+                              <span>In: ${model.input_price_per_1m}/1M</span>
+                              <span>Out: ${model.output_price_per_1m}/1M</span>
+                              <span>Max: {model.max_tokens?.toLocaleString()}</span>
+                            </div>
+                          </div>
+                          <div className="flex gap-1">
+                            <Button variant="ghost" size="sm" className="text-blue-500" onClick={() => startEditModel(model)}>
+                              <Pencil className="h-4 w-4" />
+                            </Button>
+                            <Button variant="ghost" size="sm" className="text-red-500" onClick={() => deleteModel(model.id)}>
+                              <Trash2 className="h-4 w-4" />
+                            </Button>
+                          </div>
+                        </div>
+                      )}
                     </CardContent>
                   </Card>
                 ))}
