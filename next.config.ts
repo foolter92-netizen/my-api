@@ -10,6 +10,15 @@ const nextConfig: NextConfig = {
   experimental: {
     serverComponentsExternalPackages: ['pg', 'bcryptjs', 'jsonwebtoken'],
   },
+  async rewrites() {
+    return [
+      // OpenAI-compatible API: /v1/* -> /api/v1/*
+      {
+        source: '/v1/:path*',
+        destination: '/api/v1/:path*',
+      },
+    ];
+  },
 };
 
 export default nextConfig;
