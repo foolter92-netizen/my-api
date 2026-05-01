@@ -28,6 +28,9 @@ export interface ProviderInfo {
   failover_enabled: boolean;
   timeout_ms: number;
   retry_attempts: number;
+  chat_path: string;        // e.g. '/chat/completions' or '/ai/chat'
+  auth_type: string;        // 'bearer' or 'api_key'
+  response_format: string;  // 'openai' or 'yepapi'
 }
 
 // In-memory cache for high performance

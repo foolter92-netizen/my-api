@@ -12,6 +12,9 @@ import { v4 as uuidv4 } from 'uuid';
 
 // ============================================
 // OPENAI-COMPATIBLE CHAT COMPLETIONS ENDPOINT
+// Supports multiple provider formats:
+//   - OpenAI format (bearer auth, /chat/completions)
+//   - YepAPI format (x-api-key auth, /ai/chat)
 // ============================================
 
 export async function POST(request: NextRequest) {
@@ -28,16 +31,13 @@ export async function POST(request: NextRequest) {
       const token = extractBearerToken(authHeader);
       if (token) {
         if (token.startsWith('sk-live-')) {
-          // API Key authentication
           const apiKeyRecord = await findOne('api_keys', { key: token, status: 'active' });
           if (apiKeyRecord) {
             userId = apiKeyRecord.user_id;
             apiKeyId = apiKeyRecord.id;
-            // Update last used
             await update('api_keys', { last_used_at: new Date().toISOString() }, { id: apiKeyId });
           }
         } else {
-          // JWT token
           const payload = verifyToken(token);
           if (payload) userId = payload.userId;
         }
@@ -51,7 +51,6 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    // Check user status
     const user = await findOne('users', { id: userId });
     if (!user || user.status !== 'active') {
       return NextResponse.json(
@@ -68,7 +67,6 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    // Parse request body
     const body = await request.json();
     const { model: requestedModel, messages, stream, temperature, max_tokens, top_p } = body;
 
@@ -79,7 +77,6 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    // Resolve model name (support short names)
     const modelMapping: Record<string, string> = {
       'deepseek-v3.1': 'deepseek-ai/deepseek-v3.1-terminus',
       'deepseek-v3': 'deepseek-ai/deepseek-v3.1-terminus',
@@ -88,7 +85,6 @@ export async function POST(request: NextRequest) {
     };
     const modelName = modelMapping[requestedModel] || requestedModel;
 
-    // Get provider and key
     const providerKey = await getProviderAndKeyForModel(modelName);
 
     if (!providerKey) {
@@ -100,12 +96,11 @@ export async function POST(request: NextRequest) {
 
     const { provider, key: providerKeyInfo } = providerKey;
 
-    // Get pricing
     const pricing = await getModelPricing(modelName);
     const inputPrice = pricing?.inputPricePer1k || 0;
     const outputPrice = pricing?.outputPricePer1k || 0;
 
-    // Build request to provider
+    // Build request body for provider
     const providerRequest: any = {
       model: modelName,
       messages,
@@ -115,7 +110,6 @@ export async function POST(request: NextRequest) {
     if (max_tokens !== undefined) providerRequest.max_tokens = max_tokens;
     if (top_p !== undefined) providerRequest.top_p = top_p;
 
-    // If streaming
     if (stream) {
       return handleStreamRequest(
         provider, providerKeyInfo, providerRequest,
@@ -123,7 +117,6 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    // Non-streaming request with retry and failover
     return await executeWithFailover(
       provider, providerKeyInfo, providerRequest,
       userId, apiKeyId, modelName, inputPrice, outputPrice, startTime, requestId
@@ -138,6 +131,102 @@ export async function POST(request: NextRequest) {
 }
 
 // ============================================
+// BUILD PROVIDER-SPECIFIC REQUEST
+// ============================================
+
+function buildProviderRequest(provider: any, providerKeyInfo: any, providerRequest: any) {
+  const chatPath = provider.chat_path || '/chat/completions';
+  const authType = provider.auth_type || 'bearer';
+  const url = `${provider.base_url}${chatPath}`;
+
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+  };
+
+  if (authType === 'api_key') {
+    headers['x-api-key'] = providerKeyInfo.key;
+  } else {
+    headers['Authorization'] = `Bearer ${providerKeyInfo.key}`;
+  }
+
+  return { url, headers, body: JSON.stringify(providerRequest) };
+}
+
+// ============================================
+// TRANSFORM RESPONSE TO OPENAI FORMAT
+// ============================================
+
+function transformToOpenAI(data: any, provider: any, modelName: string): any {
+  const format = provider.response_format || 'openai';
+
+  // Already OpenAI format
+  if (format === 'openai') return data;
+
+  // YepAPI format: { data: { message, usage, model, ... }, ok: true }
+  if (format === 'yepapi') {
+    const inner = data.data || data;
+    const message = inner.message || {};
+    const usage = inner.usage || {};
+
+    return {
+      id: inner.id || `chatcmpl-${Date.now()}`,
+      object: 'chat.completion',
+      created: inner.created || Math.floor(Date.now() / 1000),
+      model: inner.model || modelName,
+      choices: [
+        {
+          index: 0,
+          message: {
+            role: message.role || 'assistant',
+            content: message.content || '',
+            reasoning: message.reasoning || null,
+            refusal: message.refusal || null,
+          },
+          finish_reason: message.content ? 'stop' : 'abort',
+        }
+      ],
+      usage: {
+        prompt_tokens: usage.promptTokens || usage.prompt_tokens || 0,
+        completion_tokens: usage.completionTokens || usage.completion_tokens || 0,
+        total_tokens: usage.totalTokens || usage.total_tokens || 0,
+      },
+      system_fingerprint: inner.system_fingerprint || null,
+      provider: inner.provider || provider.name,
+    };
+  }
+
+  return data;
+}
+
+// ============================================
+// EXTRACT TOKENS FROM ANY FORMAT
+// ============================================
+
+function extractTokens(data: any, provider: any): { inputTokens: number; outputTokens: number; totalTokens: number } {
+  const format = provider.response_format || 'openai';
+
+  if (format === 'openai') {
+    return {
+      inputTokens: data.usage?.prompt_tokens || 0,
+      outputTokens: data.usage?.completion_tokens || 0,
+      totalTokens: data.usage?.total_tokens || 0,
+    };
+  }
+
+  if (format === 'yepapi') {
+    const inner = data.data || data;
+    const usage = inner.usage || {};
+    return {
+      inputTokens: usage.promptTokens || usage.prompt_tokens || 0,
+      outputTokens: usage.completionTokens || usage.completion_tokens || 0,
+      totalTokens: usage.totalTokens || usage.total_tokens || 0,
+    };
+  }
+
+  return { inputTokens: 0, outputTokens: 0, totalTokens: 0 };
+}
+
+// ============================================
 // EXECUTE WITH FAILOVER
 // ============================================
 
@@ -148,20 +237,16 @@ async function executeWithFailover(
   attemptCount: number = 0
 ): Promise<NextResponse> {
   try {
-    const response = await fetchWithTimeout(
-      `${provider.base_url}/chat/completions`,
-      {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${providerKeyInfo.key}`,
-        },
-        body: JSON.stringify(providerRequest),
-      },
-      provider.timeout_ms || 30000
-    );
+    const { url, headers, body } = buildProviderRequest(provider, providerKeyInfo, providerRequest);
 
-    // Handle rate limiting
+    console.log(`[Gateway] -> ${provider.name} ${url} model=${modelName} attempt=${attemptCount}`);
+
+    const response = await fetchWithTimeout(url, {
+      method: 'POST',
+      headers,
+      body,
+    }, provider.timeout_ms || 30000);
+
     // Handle all non-2xx responses
     if (!response.ok) {
       let errorBody = '';
@@ -210,7 +295,7 @@ async function executeWithFailover(
         }
       }
 
-      // Try to parse error as JSON for better message
+      // Parse error for better message
       let errorMsg = errorBody;
       try {
         const parsed = JSON.parse(errorBody);
@@ -229,14 +314,13 @@ async function executeWithFailover(
       );
     }
 
-    const data = await response.json();
+    const rawData = await response.json();
     const latencyMs = Date.now() - startTime;
 
-    // Extract token usage
-    const inputTokens = data.usage?.prompt_tokens || 0;
-    const outputTokens = data.usage?.completion_tokens || 0;
-    const totalTokens = data.usage?.total_tokens || 0;
-    const cost = calculateCost(inputTokens, outputTokens, inputPrice, outputPrice);
+    // Extract tokens from provider-specific format
+    const tokens = extractTokens(rawData, provider);
+
+    const cost = calculateCost(tokens.inputTokens, tokens.outputTokens, inputPrice, outputPrice);
 
     // Update key usage
     await incrementKeyUsage(providerKeyInfo.id);
@@ -248,20 +332,23 @@ async function executeWithFailover(
       model: modelName,
       providerId: provider.id,
       providerKeyId: providerKeyInfo.id,
-      inputTokens,
-      outputTokens,
-      totalTokens,
+      inputTokens: tokens.inputTokens,
+      outputTokens: tokens.outputTokens,
+      totalTokens: tokens.totalTokens,
       cost,
       latencyMs,
       status: 'success',
       requestId,
     });
 
-    return NextResponse.json(data, {
+    // Transform response to OpenAI format for the user
+    const openaiData = transformToOpenAI(rawData, provider, modelName);
+
+    return NextResponse.json(openaiData, {
       headers: {
         'X-Request-Id': requestId,
         'X-Provider': provider.name,
-        'X-Tokens-Used': totalTokens.toString(),
+        'X-Tokens-Used': tokens.totalTokens.toString(),
         'X-Cost': cost.toFixed(6),
       }
     });
@@ -303,18 +390,13 @@ async function handleStreamRequest(
   inputPrice: number, outputPrice: number, startTime: number, requestId: string
 ): Promise<NextResponse> {
   try {
-    const response = await fetchWithTimeout(
-      `${provider.base_url}/chat/completions`,
-      {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${providerKeyInfo.key}`,
-        },
-        body: JSON.stringify({ ...providerRequest, stream: true }),
-      },
-      provider.timeout_ms || 30000
-    );
+    const { url, headers, body } = buildProviderRequest(provider, providerKeyInfo, { ...providerRequest, stream: true });
+
+    const response = await fetchWithTimeout(url, {
+      method: 'POST',
+      headers,
+      body,
+    }, provider.timeout_ms || 30000);
 
     if (response.status === 429 || response.status >= 500) {
       await markKeyStatus(providerKeyInfo.id, 'rate_limited', 60000);
@@ -328,9 +410,10 @@ async function handleStreamRequest(
     }
 
     if (!response.ok) {
-      const errorBody = await response.text();
+      let errorBody = '';
+      try { errorBody = await response.text(); } catch {}
       return NextResponse.json(
-        { error: { message: `Provider error: ${errorBody}`, type: 'provider_error' } },
+        { error: { message: errorBody || `Provider returned HTTP ${response.status}`, type: 'provider_error' } },
         { status: response.status }
       );
     }
@@ -381,7 +464,6 @@ async function handleStreamRequest(
 function fetchWithTimeout(url: string, options: any, timeoutMs: number): Promise<Response> {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
-
   return fetch(url, { ...options, signal: controller.signal }).finally(() => clearTimeout(timeout));
 }
 

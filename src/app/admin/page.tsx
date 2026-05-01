@@ -24,7 +24,7 @@ export default function AdminPage() {
   const [models, setModels] = useState<any[]>([]);
   const [users, setUsers] = useState<any[]>([]);
 
-  const [newProvider, setNewProvider] = useState({ name: '', baseUrl: '', priority: '1', loadBalance: 'round_robin' });
+  const [newProvider, setNewProvider] = useState({ name: '', baseUrl: '', priority: '1', loadBalance: 'round_robin', chatPath: '/chat/completions', authType: 'bearer', responseFormat: 'openai' });
   const [newKey, setNewKey] = useState({ providerId: '', key: '', name: '', weight: '1' });
   const [newModel, setNewModel] = useState({
     providerId: '', name: '', displayName: '', inputPrice: '0', outputPrice: '0', maxTokens: '4096'
@@ -71,9 +71,12 @@ export default function AdminPage() {
         baseUrl: newProvider.baseUrl,
         priority: parseInt(newProvider.priority),
         loadBalance: newProvider.loadBalance,
+        chatPath: newProvider.chatPath,
+        authType: newProvider.authType,
+        responseFormat: newProvider.responseFormat,
       }),
     });
-    setNewProvider({ name: '', baseUrl: '', priority: '1', loadBalance: 'round_robin' });
+    setNewProvider({ name: '', baseUrl: '', priority: '1', loadBalance: 'round_robin', chatPath: '/chat/completions', authType: 'bearer', responseFormat: 'openai' });
     loadAdminData();
   };
 
@@ -294,21 +297,36 @@ export default function AdminPage() {
                   <CardTitle>Add Provider</CardTitle>
                 </CardHeader>
                 <CardContent>
-                  <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
+                  <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
                     <Input placeholder="Provider Name" value={newProvider.name} onChange={e => setNewProvider(p => ({ ...p, name: e.target.value }))} />
                     <Input placeholder="Base URL (e.g., https://api.example.com/v1)" value={newProvider.baseUrl} onChange={e => setNewProvider(p => ({ ...p, baseUrl: e.target.value }))} />
+                    <Input placeholder="Chat Path (default: /chat/completions)" value={newProvider.chatPath} onChange={e => setNewProvider(p => ({ ...p, chatPath: e.target.value }))} />
+                    <Select value={newProvider.authType} onValueChange={v => setNewProvider(p => ({ ...p, authType: v }))}>
+                      <SelectTrigger><SelectValue placeholder="Auth Type" /></SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="bearer">Bearer Token</SelectItem>
+                        <SelectItem value="api_key">x-api-key Header</SelectItem>
+                      </SelectContent>
+                    </Select>
+                    <Select value={newProvider.responseFormat} onValueChange={v => setNewProvider(p => ({ ...p, responseFormat: v }))}>
+                      <SelectTrigger><SelectValue placeholder="Response Format" /></SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="openai">OpenAI Format</SelectItem>
+                        <SelectItem value="yepapi">YepAPI Format</SelectItem>
+                      </SelectContent>
+                    </Select>
                     <Select value={newProvider.loadBalance} onValueChange={v => setNewProvider(p => ({ ...p, loadBalance: v }))}>
-                      <SelectTrigger><SelectValue /></SelectTrigger>
+                      <SelectTrigger><SelectValue placeholder="Load Balance" /></SelectTrigger>
                       <SelectContent>
                         <SelectItem value="round_robin">Round Robin</SelectItem>
                         <SelectItem value="least_used">Least Used</SelectItem>
                         <SelectItem value="random_weighted">Random Weighted</SelectItem>
                       </SelectContent>
                     </Select>
-                    <Button onClick={createProvider} disabled={!newProvider.name || !newProvider.baseUrl}>
-                      <Plus className="h-4 w-4 mr-1" /> Add Provider
-                    </Button>
                   </div>
+                  <Button onClick={createProvider} className="mt-3" disabled={!newProvider.name || !newProvider.baseUrl}>
+                    <Plus className="h-4 w-4 mr-1" /> Add Provider
+                  </Button>
                 </CardContent>
               </Card>
 
@@ -328,6 +346,11 @@ export default function AdminPage() {
                           <p className="text-xs text-muted-foreground mt-1">
                             {provider.key_count} keys | {provider.model_count} models | Failover: {provider.failover_enabled ? 'On' : 'Off'}
                           </p>
+                          <div className="flex gap-1 mt-1 flex-wrap">
+                            <Badge variant="outline" className="text-xs">Path: {provider.chat_path || '/chat/completions'}</Badge>
+                            <Badge variant="outline" className="text-xs">Auth: {provider.auth_type || 'bearer'}</Badge>
+                            <Badge variant="outline" className="text-xs">Format: {provider.response_format || 'openai'}</Badge>
+                          </div>
                         </div>
                         <Button variant="ghost" size="sm" className="text-red-500" onClick={() => deleteProvider(provider.id)}>
                           <Trash2 className="h-4 w-4" />

@@ -10,12 +10,19 @@ import {
 import { logUsage, getModelPricing, calculateCost } from '@/lib/usage';
 import { v4 as uuidv4 } from 'uuid';
 
-// Alias: /v1 also handles chat completions (same as /v1/chat/completions)
+// ============================================
+// OPENAI-COMPATIBLE CHAT COMPLETIONS ENDPOINT
+// Supports multiple provider formats:
+//   - OpenAI format (bearer auth, /chat/completions)
+//   - YepAPI format (x-api-key auth, /ai/chat)
+// ============================================
+
 export async function POST(request: NextRequest) {
   const startTime = Date.now();
   const requestId = uuidv4();
 
   try {
+    // Authenticate via API key or Bearer token
     const authHeader = request.headers.get('authorization');
     let userId: string | null = null;
     let apiKeyId: string | null = null;
@@ -88,11 +95,17 @@ export async function POST(request: NextRequest) {
     }
 
     const { provider, key: providerKeyInfo } = providerKey;
+
     const pricing = await getModelPricing(modelName);
     const inputPrice = pricing?.inputPricePer1k || 0;
     const outputPrice = pricing?.outputPricePer1k || 0;
 
-    const providerRequest: any = { model: modelName, messages, stream: !!stream };
+    // Build request body for provider
+    const providerRequest: any = {
+      model: modelName,
+      messages,
+      stream: !!stream,
+    };
     if (temperature !== undefined) providerRequest.temperature = temperature;
     if (max_tokens !== undefined) providerRequest.max_tokens = max_tokens;
     if (top_p !== undefined) providerRequest.top_p = top_p;
@@ -117,6 +130,106 @@ export async function POST(request: NextRequest) {
   }
 }
 
+// ============================================
+// BUILD PROVIDER-SPECIFIC REQUEST
+// ============================================
+
+function buildProviderRequest(provider: any, providerKeyInfo: any, providerRequest: any) {
+  const chatPath = provider.chat_path || '/chat/completions';
+  const authType = provider.auth_type || 'bearer';
+  const url = `${provider.base_url}${chatPath}`;
+
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+  };
+
+  if (authType === 'api_key') {
+    headers['x-api-key'] = providerKeyInfo.key;
+  } else {
+    headers['Authorization'] = `Bearer ${providerKeyInfo.key}`;
+  }
+
+  return { url, headers, body: JSON.stringify(providerRequest) };
+}
+
+// ============================================
+// TRANSFORM RESPONSE TO OPENAI FORMAT
+// ============================================
+
+function transformToOpenAI(data: any, provider: any, modelName: string): any {
+  const format = provider.response_format || 'openai';
+
+  // Already OpenAI format
+  if (format === 'openai') return data;
+
+  // YepAPI format: { data: { message, usage, model, ... }, ok: true }
+  if (format === 'yepapi') {
+    const inner = data.data || data;
+    const message = inner.message || {};
+    const usage = inner.usage || {};
+
+    return {
+      id: inner.id || `chatcmpl-${Date.now()}`,
+      object: 'chat.completion',
+      created: inner.created || Math.floor(Date.now() / 1000),
+      model: inner.model || modelName,
+      choices: [
+        {
+          index: 0,
+          message: {
+            role: message.role || 'assistant',
+            content: message.content || '',
+            reasoning: message.reasoning || null,
+            refusal: message.refusal || null,
+          },
+          finish_reason: message.content ? 'stop' : 'abort',
+        }
+      ],
+      usage: {
+        prompt_tokens: usage.promptTokens || usage.prompt_tokens || 0,
+        completion_tokens: usage.completionTokens || usage.completion_tokens || 0,
+        total_tokens: usage.totalTokens || usage.total_tokens || 0,
+      },
+      system_fingerprint: inner.system_fingerprint || null,
+      provider: inner.provider || provider.name,
+    };
+  }
+
+  return data;
+}
+
+// ============================================
+// EXTRACT TOKENS FROM ANY FORMAT
+// ============================================
+
+function extractTokens(data: any, provider: any): { inputTokens: number; outputTokens: number; totalTokens: number } {
+  const format = provider.response_format || 'openai';
+
+  if (format === 'openai') {
+    return {
+      inputTokens: data.usage?.prompt_tokens || 0,
+      outputTokens: data.usage?.completion_tokens || 0,
+      totalTokens: data.usage?.total_tokens || 0,
+    };
+  }
+
+  if (format === 'yepapi') {
+    const inner = data.data || data;
+    const usage = inner.usage || {};
+    return {
+      inputTokens: usage.promptTokens || usage.prompt_tokens || 0,
+      outputTokens: usage.completionTokens || usage.completion_tokens || 0,
+      totalTokens: usage.totalTokens || usage.total_tokens || 0,
+    };
+  }
+
+  return { inputTokens: 0, outputTokens: 0, totalTokens: 0 };
+}
+
+// ============================================
+// EXECUTE WITH FAILOVER
+// ============================================
+
 async function executeWithFailover(
   provider: any, providerKeyInfo: any, providerRequest: any,
   userId: string, apiKeyId: string | null, modelName: string,
@@ -124,26 +237,25 @@ async function executeWithFailover(
   attemptCount: number = 0
 ): Promise<NextResponse> {
   try {
-    const response = await fetchWithTimeout(
-      `${provider.base_url}/chat/completions`,
-      {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${providerKeyInfo.key}`,
-        },
-        body: JSON.stringify(providerRequest),
-      },
-      provider.timeout_ms || 30000
-    );
+    const { url, headers, body } = buildProviderRequest(provider, providerKeyInfo, providerRequest);
+
+    console.log(`[Gateway] -> ${provider.name} ${url} model=${modelName} attempt=${attemptCount}`);
+
+    const response = await fetchWithTimeout(url, {
+      method: 'POST',
+      headers,
+      body,
+    }, provider.timeout_ms || 30000);
 
     // Handle all non-2xx responses
     if (!response.ok) {
       let errorBody = '';
       try { errorBody = await response.text(); } catch {}
 
+      // Mark key as rate limited on 429
       if (response.status === 429) {
         await markKeyStatus(providerKeyInfo.id, 'rate_limited', 60000);
+
         if (attemptCount < (provider.retry_attempts || 3)) {
           const failover = await getFailoverProviderAndKey(provider.id, modelName);
           if (failover) {
@@ -153,6 +265,7 @@ async function executeWithFailover(
             );
           }
         }
+
         await logUsage({
           userId, apiKeyId: apiKeyId || undefined, model: modelName,
           providerId: provider.id, providerKeyId: providerKeyInfo.id,
@@ -160,14 +273,17 @@ async function executeWithFailover(
           cost: 0, latencyMs: Date.now() - startTime,
           status: 'rate_limited', errorMessage: 'Rate limited', requestId,
         });
+
         return NextResponse.json(
           { error: { message: 'Rate limited. Please try again later.', type: 'rate_limit_error' } },
           { status: 429 }
         );
       }
 
+      // Mark key on 5xx errors and try failover
       if (response.status >= 500) {
         await markKeyStatus(providerKeyInfo.id, 'rate_limited', 30000);
+
         if (attemptCount < (provider.retry_attempts || 3)) {
           const failover = await getFailoverProviderAndKey(provider.id, modelName);
           if (failover) {
@@ -179,6 +295,7 @@ async function executeWithFailover(
         }
       }
 
+      // Parse error for better message
       let errorMsg = errorBody;
       try {
         const parsed = JSON.parse(errorBody);
@@ -197,32 +314,48 @@ async function executeWithFailover(
       );
     }
 
-    const data = await response.json();
+    const rawData = await response.json();
     const latencyMs = Date.now() - startTime;
-    const inputTokens = data.usage?.prompt_tokens || 0;
-    const outputTokens = data.usage?.completion_tokens || 0;
-    const totalTokens = data.usage?.total_tokens || 0;
-    const cost = calculateCost(inputTokens, outputTokens, inputPrice, outputPrice);
 
+    // Extract tokens from provider-specific format
+    const tokens = extractTokens(rawData, provider);
+
+    const cost = calculateCost(tokens.inputTokens, tokens.outputTokens, inputPrice, outputPrice);
+
+    // Update key usage
     await incrementKeyUsage(providerKeyInfo.id);
+
+    // Log usage
     await logUsage({
-      userId, apiKeyId: apiKeyId || undefined, model: modelName,
-      providerId: provider.id, providerKeyId: providerKeyInfo.id,
-      inputTokens, outputTokens, totalTokens, cost, latencyMs,
-      status: 'success', requestId,
+      userId,
+      apiKeyId: apiKeyId || undefined,
+      model: modelName,
+      providerId: provider.id,
+      providerKeyId: providerKeyInfo.id,
+      inputTokens: tokens.inputTokens,
+      outputTokens: tokens.outputTokens,
+      totalTokens: tokens.totalTokens,
+      cost,
+      latencyMs,
+      status: 'success',
+      requestId,
     });
 
-    return NextResponse.json(data, {
+    // Transform response to OpenAI format for the user
+    const openaiData = transformToOpenAI(rawData, provider, modelName);
+
+    return NextResponse.json(openaiData, {
       headers: {
         'X-Request-Id': requestId,
         'X-Provider': provider.name,
-        'X-Tokens-Used': totalTokens.toString(),
+        'X-Tokens-Used': tokens.totalTokens.toString(),
         'X-Cost': cost.toFixed(6),
       }
     });
   } catch (error: any) {
     if (error.name === 'AbortError' || error.message?.includes('timeout')) {
       await markKeyStatus(providerKeyInfo.id, 'rate_limited', 30000);
+
       const failover = await getFailoverProviderAndKey(provider.id, modelName);
       if (failover && attemptCount < (provider.retry_attempts || 3)) {
         return executeWithFailover(
@@ -231,6 +364,7 @@ async function executeWithFailover(
         );
       }
     }
+
     await logUsage({
       userId, apiKeyId: apiKeyId || undefined, model: modelName,
       providerId: provider.id, providerKeyId: providerKeyInfo.id,
@@ -238,6 +372,7 @@ async function executeWithFailover(
       cost: 0, latencyMs: Date.now() - startTime,
       status: 'error', errorMessage: error.message, requestId,
     });
+
     return NextResponse.json(
       { error: { message: 'Gateway request failed', type: 'gateway_error' } },
       { status: 500 }
@@ -245,24 +380,23 @@ async function executeWithFailover(
   }
 }
 
+// ============================================
+// STREAMING HANDLER
+// ============================================
+
 async function handleStreamRequest(
   provider: any, providerKeyInfo: any, providerRequest: any,
   userId: string, apiKeyId: string | null, modelName: string,
   inputPrice: number, outputPrice: number, startTime: number, requestId: string
 ): Promise<NextResponse> {
   try {
-    const response = await fetchWithTimeout(
-      `${provider.base_url}/chat/completions`,
-      {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${providerKeyInfo.key}`,
-        },
-        body: JSON.stringify({ ...providerRequest, stream: true }),
-      },
-      provider.timeout_ms || 30000
-    );
+    const { url, headers, body } = buildProviderRequest(provider, providerKeyInfo, { ...providerRequest, stream: true });
+
+    const response = await fetchWithTimeout(url, {
+      method: 'POST',
+      headers,
+      body,
+    }, provider.timeout_ms || 30000);
 
     if (response.status === 429 || response.status >= 500) {
       await markKeyStatus(providerKeyInfo.id, 'rate_limited', 60000);
@@ -276,23 +410,33 @@ async function handleStreamRequest(
     }
 
     if (!response.ok) {
-      const errorBody = await response.text();
+      let errorBody = '';
+      try { errorBody = await response.text(); } catch {}
       return NextResponse.json(
-        { error: { message: `Provider error: ${errorBody}`, type: 'provider_error' } },
+        { error: { message: errorBody || `Provider returned HTTP ${response.status}`, type: 'provider_error' } },
         { status: response.status }
       );
     }
 
     const latencyMs = Date.now() - startTime;
     await incrementKeyUsage(providerKeyInfo.id);
+
     const inputTokens = estimateTokens(JSON.stringify(providerRequest.messages));
     const cost = calculateCost(inputTokens, 0, inputPrice, outputPrice);
 
     await logUsage({
-      userId, apiKeyId: apiKeyId || undefined, model: modelName,
-      providerId: provider.id, providerKeyId: providerKeyInfo.id,
-      inputTokens, outputTokens: 0, totalTokens: inputTokens,
-      cost, latencyMs, status: 'success', requestId,
+      userId,
+      apiKeyId: apiKeyId || undefined,
+      model: modelName,
+      providerId: provider.id,
+      providerKeyId: providerKeyInfo.id,
+      inputTokens,
+      outputTokens: 0,
+      totalTokens: inputTokens,
+      cost,
+      latencyMs,
+      status: 'success',
+      requestId,
     });
 
     return new Response(response.body, {
@@ -312,6 +456,10 @@ async function handleStreamRequest(
     );
   }
 }
+
+// ============================================
+// UTILITIES
+// ============================================
 
 function fetchWithTimeout(url: string, options: any, timeoutMs: number): Promise<Response> {
   const controller = new AbortController();

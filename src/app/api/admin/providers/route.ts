@@ -40,7 +40,7 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: 'Admin access required' }, { status: 403 });
     }
 
-    const { name, baseUrl, priority, loadBalance, failoverEnabled, timeoutMs, retryAttempts } = await request.json();
+    const { name, baseUrl, priority, loadBalance, failoverEnabled, timeoutMs, retryAttempts, chatPath, authType, responseFormat } = await request.json();
 
     if (!name || !baseUrl) {
       return NextResponse.json({ error: 'Name and base URL are required' }, { status: 400 });
@@ -57,6 +57,9 @@ export async function POST(request: NextRequest) {
       timeout_ms: timeoutMs || 30000,
       retry_attempts: retryAttempts || 3,
       status: 'active',
+      chat_path: chatPath || '/chat/completions',
+      auth_type: authType || 'bearer',
+      response_format: responseFormat || 'openai',
     });
 
     return NextResponse.json({ success: true, data: { id } }, { status: 201 });
@@ -76,7 +79,7 @@ export async function PUT(request: NextRequest) {
       return NextResponse.json({ error: 'Admin access required' }, { status: 403 });
     }
 
-    const { id, name, baseUrl, status, priority, loadBalance, failoverEnabled, timeoutMs, retryAttempts } = await request.json();
+    const { id, name, baseUrl, status, priority, loadBalance, failoverEnabled, timeoutMs, retryAttempts, chatPath, authType, responseFormat } = await request.json();
 
     const updateData: any = { updated_at: new Date().toISOString() };
     if (name) updateData.name = name;
@@ -87,6 +90,9 @@ export async function PUT(request: NextRequest) {
     if (failoverEnabled !== undefined) updateData.failover_enabled = failoverEnabled;
     if (timeoutMs) updateData.timeout_ms = timeoutMs;
     if (retryAttempts) updateData.retry_attempts = retryAttempts;
+    if (chatPath !== undefined) updateData.chat_path = chatPath;
+    if (authType !== undefined) updateData.auth_type = authType;
+    if (responseFormat !== undefined) updateData.response_format = responseFormat;
 
     await update('providers', updateData, { id });
 
