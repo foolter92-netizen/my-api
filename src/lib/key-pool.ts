@@ -180,6 +180,26 @@ export async function incrementKeyUsage(keyId: string) {
   }
 }
 
+// Get another key from the SAME provider (excluding the failed key)
+export async function getNextKeyFromSameProvider(
+  providerId: string,
+  failedKeyId: string
+): Promise<ProviderKeyInfo | null> {
+  await refreshCache();
+
+  const keys = keyPoolCache.get(providerId) || [];
+  // Filter out the failed key
+  const otherKeys = keys.filter(k => k.id !== failedKeyId);
+
+  if (otherKeys.length === 0) return null;
+
+  const provider = providerCache.find(p => p.id === providerId);
+  if (!provider) return null;
+
+  return selectKey(otherKeys, provider.load_balance, provider.id);
+}
+
+// Get a key from a DIFFERENT provider (last resort)
 export async function getFailoverProviderAndKey(
   originalProviderId: string,
   modelName: string

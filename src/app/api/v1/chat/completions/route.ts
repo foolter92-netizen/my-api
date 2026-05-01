@@ -4,6 +4,7 @@ import { verifyToken, extractBearerToken } from '@/lib/auth';
 import {
   getProviderAndKeyForModel,
   getFailoverProviderAndKey,
+  getNextKeyFromSameProvider,
   markKeyStatus,
   incrementKeyUsage,
 } from '@/lib/key-pool';
@@ -268,9 +269,20 @@ async function executeWithFailover(
         }
 
         if (attemptCount < (provider.retry_attempts || 3)) {
+          // STEP 1: Try another key from the SAME provider first
+          const sameProviderKey = await getNextKeyFromSameProvider(provider.id, providerKeyInfo.id);
+          if (sameProviderKey) {
+            console.log(`[Failover] ${provider.name} key failed (${response.status}), trying next key from same provider`);
+            return executeWithFailover(
+              provider, sameProviderKey, providerRequest,
+              userId, apiKeyId, modelName, inputPrice, outputPrice, startTime, requestId, attemptCount + 1
+            );
+          }
+
+          // STEP 2: No more keys in same provider, try a DIFFERENT provider
           const failover = await getFailoverProviderAndKey(provider.id, modelName);
           if (failover) {
-            console.log(`[Failover] ${provider.name} returned ${response.status}, switching to ${failover.provider.name}`);
+            console.log(`[Failover] No more keys in ${provider.name}, switching to ${failover.provider.name}`);
             return executeWithFailover(
               failover.provider, failover.key, providerRequest,
               userId, apiKeyId, modelName, inputPrice, outputPrice, startTime, requestId, attemptCount + 1
@@ -350,12 +362,26 @@ async function executeWithFailover(
     if (error.name === 'AbortError' || error.message?.includes('timeout')) {
       await markKeyStatus(providerKeyInfo.id, 'rate_limited', 30000);
 
-      const failover = await getFailoverProviderAndKey(provider.id, modelName);
-      if (failover && attemptCount < (provider.retry_attempts || 3)) {
-        return executeWithFailover(
-          failover.provider, failover.key, providerRequest,
-          userId, apiKeyId, modelName, inputPrice, outputPrice, startTime, requestId, attemptCount + 1
-        );
+      if (attemptCount < (provider.retry_attempts || 3)) {
+        // STEP 1: Try another key from the SAME provider first
+        const sameProviderKey = await getNextKeyFromSameProvider(provider.id, providerKeyInfo.id);
+        if (sameProviderKey) {
+          console.log(`[Failover] ${provider.name} key timed out, trying next key from same provider`);
+          return executeWithFailover(
+            provider, sameProviderKey, providerRequest,
+            userId, apiKeyId, modelName, inputPrice, outputPrice, startTime, requestId, attemptCount + 1
+          );
+        }
+
+        // STEP 2: No more keys, try different provider
+        const failover = await getFailoverProviderAndKey(provider.id, modelName);
+        if (failover) {
+          console.log(`[Failover] No more keys in ${provider.name} (timeout), switching to ${failover.provider.name}`);
+          return executeWithFailover(
+            failover.provider, failover.key, providerRequest,
+            userId, apiKeyId, modelName, inputPrice, outputPrice, startTime, requestId, attemptCount + 1
+          );
+        }
       }
     }
 
@@ -403,9 +429,20 @@ async function handleStreamRequest(
         await markKeyStatus(providerKeyInfo.id, 'rate_limited', 60000);
       }
 
+      // STEP 1: Try another key from the SAME provider first
+      const sameProviderKey = await getNextKeyFromSameProvider(provider.id, providerKeyInfo.id);
+      if (sameProviderKey) {
+        console.log(`[Stream Failover] ${provider.name} key failed (${response.status}), trying next key from same provider`);
+        return handleStreamRequest(
+          provider, sameProviderKey, providerRequest,
+          userId, apiKeyId, modelName, inputPrice, outputPrice, startTime, requestId
+        );
+      }
+
+      // STEP 2: No more keys in same provider, try a DIFFERENT provider
       const failover = await getFailoverProviderAndKey(provider.id, modelName);
       if (failover) {
-        console.log(`[Stream Failover] ${provider.name} returned ${response.status}, switching to ${failover.provider.name}`);
+        console.log(`[Stream Failover] No more keys in ${provider.name}, switching to ${failover.provider.name}`);
         return handleStreamRequest(
           failover.provider, failover.key, providerRequest,
           userId, apiKeyId, modelName, inputPrice, outputPrice, startTime, requestId
