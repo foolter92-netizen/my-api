@@ -137,52 +137,62 @@ async function executeWithFailover(
       provider.timeout_ms || 30000
     );
 
-    if (response.status === 429) {
-      await markKeyStatus(providerKeyInfo.id, 'rate_limited', 60000);
-      if (attemptCount < (provider.retry_attempts || 3)) {
-        const failover = await getFailoverProviderAndKey(provider.id, modelName);
-        if (failover) {
-          return executeWithFailover(
-            failover.provider, failover.key, providerRequest,
-            userId, apiKeyId, modelName, inputPrice, outputPrice, startTime, requestId, attemptCount + 1
-          );
-        }
-      }
-      await logUsage({
-        userId, apiKeyId: apiKeyId || undefined, model: modelName,
-        providerId: provider.id, providerKeyId: providerKeyInfo.id,
-        inputTokens: 0, outputTokens: 0, totalTokens: 0,
-        cost: 0, latencyMs: Date.now() - startTime,
-        status: 'rate_limited', errorMessage: 'Rate limited', requestId,
-      });
-      return NextResponse.json(
-        { error: { message: 'Rate limited. Please try again later.', type: 'rate_limit_error' } },
-        { status: 429 }
-      );
-    }
-
-    if (response.status >= 500) {
-      await markKeyStatus(providerKeyInfo.id, 'rate_limited', 30000);
-      if (attemptCount < (provider.retry_attempts || 3)) {
-        const failover = await getFailoverProviderAndKey(provider.id, modelName);
-        if (failover) {
-          return executeWithFailover(
-            failover.provider, failover.key, providerRequest,
-            userId, apiKeyId, modelName, inputPrice, outputPrice, startTime, requestId, attemptCount + 1
-          );
-        }
-      }
-      const errorBody = await response.text();
-      return NextResponse.json(
-        { error: { message: `Provider error: ${errorBody}`, type: 'provider_error' } },
-        { status: response.status }
-      );
-    }
-
+    // Handle all non-2xx responses
     if (!response.ok) {
-      const errorBody = await response.text();
+      let errorBody = '';
+      try { errorBody = await response.text(); } catch {}
+
+      if (response.status === 429) {
+        await markKeyStatus(providerKeyInfo.id, 'rate_limited', 60000);
+        if (attemptCount < (provider.retry_attempts || 3)) {
+          const failover = await getFailoverProviderAndKey(provider.id, modelName);
+          if (failover) {
+            return executeWithFailover(
+              failover.provider, failover.key, providerRequest,
+              userId, apiKeyId, modelName, inputPrice, outputPrice, startTime, requestId, attemptCount + 1
+            );
+          }
+        }
+        await logUsage({
+          userId, apiKeyId: apiKeyId || undefined, model: modelName,
+          providerId: provider.id, providerKeyId: providerKeyInfo.id,
+          inputTokens: 0, outputTokens: 0, totalTokens: 0,
+          cost: 0, latencyMs: Date.now() - startTime,
+          status: 'rate_limited', errorMessage: 'Rate limited', requestId,
+        });
+        return NextResponse.json(
+          { error: { message: 'Rate limited. Please try again later.', type: 'rate_limit_error' } },
+          { status: 429 }
+        );
+      }
+
+      if (response.status >= 500) {
+        await markKeyStatus(providerKeyInfo.id, 'rate_limited', 30000);
+        if (attemptCount < (provider.retry_attempts || 3)) {
+          const failover = await getFailoverProviderAndKey(provider.id, modelName);
+          if (failover) {
+            return executeWithFailover(
+              failover.provider, failover.key, providerRequest,
+              userId, apiKeyId, modelName, inputPrice, outputPrice, startTime, requestId, attemptCount + 1
+            );
+          }
+        }
+      }
+
+      let errorMsg = errorBody;
+      try {
+        const parsed = JSON.parse(errorBody);
+        errorMsg = parsed.error?.message || parsed.message || parsed.error?.type || errorBody;
+      } catch {}
+
+      if (!errorMsg) {
+        errorMsg = `Provider returned HTTP ${response.status}`;
+      }
+
+      console.error(`Provider error [${response.status}]: ${provider.name} - ${errorMsg}`);
+
       return NextResponse.json(
-        { error: { message: `Provider error: ${errorBody}`, type: 'provider_error' } },
+        { error: { message: errorMsg, type: 'provider_error', provider: provider.name, status: response.status } },
         { status: response.status }
       );
     }
