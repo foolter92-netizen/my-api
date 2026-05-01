@@ -107,8 +107,8 @@ model Model {
   providerId          String
   name                String    @unique // "deepseek-ai/deepseek-v3.1-terminus"
   displayName         String    // "DeepSeek V3.1"
-  inputPricePer1k     Float     @default(0) // Price per 1K input tokens (USD)
-  outputPricePer1k    Float     @default(0) // Price per 1K output tokens (USD)
+  inputPricePer1m     Float     @default(0) // Price per 1M input tokens (USD)
+  outputPricePer1m    Float     @default(0) // Price per 1M output tokens (USD)
   maxTokens           Int       @default(4096)
   status              String    @default("active") // "active" | "inactive"
   description         String?

@@ -101,8 +101,8 @@ export default function AdminPage() {
         providerId: newModel.providerId,
         name: newModel.name,
         displayName: newModel.displayName,
-        inputPricePer1k: parseFloat(newModel.inputPrice),
-        outputPricePer1k: parseFloat(newModel.outputPrice),
+        inputPricePer1m: parseFloat(newModel.inputPrice),
+        outputPricePer1m: parseFloat(newModel.outputPrice),
         maxTokens: parseInt(newModel.maxTokens),
       }),
     });
@@ -458,8 +458,8 @@ export default function AdminPage() {
                     </Select>
                     <Input placeholder="Model Name (e.g., deepseek-ai/deepseek-v3.1)" value={newModel.name} onChange={e => setNewModel(m => ({ ...m, name: e.target.value }))} />
                     <Input placeholder="Display Name" value={newModel.displayName} onChange={e => setNewModel(m => ({ ...m, displayName: e.target.value }))} />
-                    <Input placeholder="Input Price per 1K tokens" type="number" step="0.0001" value={newModel.inputPrice} onChange={e => setNewModel(m => ({ ...m, inputPrice: e.target.value }))} />
-                    <Input placeholder="Output Price per 1K tokens" type="number" step="0.0001" value={newModel.outputPrice} onChange={e => setNewModel(m => ({ ...m, outputPrice: e.target.value }))} />
+                    <Input placeholder="Input Price per 1M tokens" type="number" step="0.01" value={newModel.inputPrice} onChange={e => setNewModel(m => ({ ...m, inputPrice: e.target.value }))} />
+                    <Input placeholder="Output Price per 1M tokens" type="number" step="0.01" value={newModel.outputPrice} onChange={e => setNewModel(m => ({ ...m, outputPrice: e.target.value }))} />
                     <Input placeholder="Max Tokens" type="number" value={newModel.maxTokens} onChange={e => setNewModel(m => ({ ...m, maxTokens: e.target.value }))} />
                   </div>
                   <Button onClick={createModel} className="mt-3" disabled={!newModel.providerId || !newModel.name || !newModel.displayName}>
@@ -481,8 +481,8 @@ export default function AdminPage() {
                           </div>
                           <p className="text-sm font-mono text-muted-foreground">{model.name}</p>
                           <div className="flex gap-4 mt-1 text-sm text-muted-foreground">
-                            <span>In: ${model.input_price_per_1k}/1K</span>
-                            <span>Out: ${model.output_price_per_1k}/1K</span>
+                            <span>In: ${model.input_price_per_1m}/1M</span>
+                            <span>Out: ${model.output_price_per_1m}/1M</span>
                             <span>Max: {model.max_tokens?.toLocaleString()}</span>
                           </div>
                         </div>

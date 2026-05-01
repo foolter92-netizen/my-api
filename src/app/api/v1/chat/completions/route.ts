@@ -98,8 +98,8 @@ export async function POST(request: NextRequest) {
     const { provider, key: providerKeyInfo } = providerKey;
 
     const pricing = await getModelPricing(modelName);
-    const inputPrice = pricing?.inputPricePer1k || 0;
-    const outputPrice = pricing?.outputPricePer1k || 0;
+    const inputPrice = pricing?.inputPricePer1m || 0;
+    const outputPrice = pricing?.outputPricePer1m || 0;
 
     // Build request body for provider
     const providerRequest: any = {

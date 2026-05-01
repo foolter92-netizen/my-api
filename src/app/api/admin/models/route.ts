@@ -39,7 +39,7 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: 'Admin access required' }, { status: 403 });
     }
 
-    const { providerId, name, displayName, inputPricePer1k, outputPricePer1k, maxTokens, description } = await request.json();
+    const { providerId, name, displayName, inputPricePer1m, outputPricePer1m, maxTokens, description } = await request.json();
 
     if (!providerId || !name || !displayName) {
       return NextResponse.json({ error: 'Provider ID, name, and display name are required' }, { status: 400 });
@@ -51,8 +51,8 @@ export async function POST(request: NextRequest) {
       provider_id: providerId,
       name,
       display_name: displayName,
-      input_price_per_1k: inputPricePer1k || 0,
-      output_price_per_1k: outputPricePer1k || 0,
+      input_price_per_1m: inputPricePer1m || 0,
+      output_price_per_1m: outputPricePer1m || 0,
       max_tokens: maxTokens || 4096,
       description: description || null,
       status: 'active',
@@ -75,12 +75,12 @@ export async function PUT(request: NextRequest) {
       return NextResponse.json({ error: 'Admin access required' }, { status: 403 });
     }
 
-    const { id, displayName, inputPricePer1k, outputPricePer1k, maxTokens, status, description } = await request.json();
+    const { id, displayName, inputPricePer1m, outputPricePer1m, maxTokens, status, description } = await request.json();
 
     const updateData: any = {};
     if (displayName) updateData.display_name = displayName;
-    if (inputPricePer1k !== undefined) updateData.input_price_per_1k = inputPricePer1k;
-    if (outputPricePer1k !== undefined) updateData.output_price_per_1k = outputPricePer1k;
+    if (inputPricePer1m !== undefined) updateData.input_price_per_1m = inputPricePer1m;
+    if (outputPricePer1m !== undefined) updateData.output_price_per_1m = outputPricePer1m;
     if (maxTokens) updateData.max_tokens = maxTokens;
     if (status) updateData.status = status;
     if (description !== undefined) updateData.description = description;

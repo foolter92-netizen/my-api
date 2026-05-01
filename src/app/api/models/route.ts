@@ -20,8 +20,8 @@ export async function GET() {
           created: Math.floor(Date.now() / 1000),
           owned_by: provider.name,
           pricing: {
-            input: parseFloat(m.input_price_per_1k),
-            output: parseFloat(m.output_price_per_1k),
+            input: parseFloat(m.input_price_per_1m),
+            output: parseFloat(m.output_price_per_1m),
           },
           max_tokens: m.max_tokens,
           description: m.description,

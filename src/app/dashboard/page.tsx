@@ -495,11 +495,11 @@ export default function DashboardPage() {
                       <div className="grid grid-cols-2 gap-2 text-sm">
                         <div>
                           <span className="text-muted-foreground">Input: </span>
-                          <span className="font-mono">${model.pricing?.input || 0}/1K</span>
+                          <span className="font-mono">${model.pricing?.input || 0}/1M</span>
                         </div>
                         <div>
                           <span className="text-muted-foreground">Output: </span>
-                          <span className="font-mono">${model.pricing?.output || 0}/1K</span>
+                          <span className="font-mono">${model.pricing?.output || 0}/1M</span>
                         </div>
                         <div>
                           <span className="text-muted-foreground">Max Tokens: </span>

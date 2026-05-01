@@ -63,24 +63,24 @@ export async function logUsage(record: UsageRecord): Promise<string> {
 }
 
 export async function getModelPricing(modelName: string): Promise<{
-  inputPricePer1k: number;
-  outputPricePer1k: number;
+  inputPricePer1m: number;
+  outputPricePer1m: number;
 } | null> {
   const model = await findOne('models', { name: modelName, status: 'active' });
   if (!model) return null;
   return {
-    inputPricePer1k: parseFloat(model.input_price_per_1k),
-    outputPricePer1k: parseFloat(model.output_price_per_1k),
+    inputPricePer1m: parseFloat(model.input_price_per_1m),
+    outputPricePer1m: parseFloat(model.output_price_per_1m),
   };
 }
 
 export function calculateCost(
   inputTokens: number,
   outputTokens: number,
-  inputPricePer1k: number,
-  outputPricePer1k: number
+  inputPricePer1m: number,
+  outputPricePer1m: number
 ): number {
-  return (inputTokens / 1000) * inputPricePer1k + (outputTokens / 1000) * outputPricePer1k;
+  return (inputTokens / 1000000) * inputPricePer1m + (outputTokens / 1000000) * outputPricePer1m;
 }
 
 export async function checkUserBalance(userId: string): Promise<number> {
