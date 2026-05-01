@@ -1,0 +1,185 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+// ============================================
+// USER & AUTH
+// ============================================
+
+model User {
+  id            String   @id @default(cuid())
+  email         String   @unique
+  name          String?
+  passwordHash  String
+  role          String   @default("user") // "user" | "admin"
+  balance       Float    @default(0) // USD balance
+  status        String   @default("active") // "active" | "suspended" | "banned"
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  apiKeys       ApiKey[]
+  usageLogs     UsageLog[]
+  billingTransactions BillingTransaction[]
+
+  @@map("users")
+}
+
+// ============================================
+// USER API KEYS
+// ============================================
+
+model ApiKey {
+  id            String    @id @default(cuid())
+  userId        String
+  key           String    @unique // sk-live-xxxxxxxx
+  name          String    @default("Default Key")
+  status        String    @default("active") // "active" | "revoked"
+  lastUsedAt    DateTime?
+  createdAt     DateTime  @default(now())
+
+  user          User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  usageLogs     UsageLog[]
+
+  @@map("api_keys")
+}
+
+// ============================================
+// PROVIDERS (AI Model Providers)
+// ============================================
+
+model Provider {
+  id            String        @id @default(cuid())
+  name          String        @unique // "MegaLLM", "OpenAI", "ProviderX"
+  baseUrl       String        // "https://ai.megallm.io/v1"
+  status        String        @default("active") // "active" | "inactive" | "maintenance"
+  priority      Int           @default(1) // Lower = higher priority
+  loadBalance   String        @default("round_robin") // "round_robin" | "least_used" | "random_weighted"
+  failoverEnabled Boolean     @default(true)
+  timeoutMs     Int           @default(30000)
+  retryAttempts Int           @default(3)
+  createdAt     DateTime      @default(now())
+  updatedAt     DateTime      @updatedAt
+
+  providerKeys  ProviderKey[]
+  models        Model[]
+  usageLogs     UsageLog[]
+
+  @@map("providers")
+}
+
+// ============================================
+// PROVIDER KEY POOL
+// ============================================
+
+model ProviderKey {
+  id              String    @id @default(cuid())
+  providerId      String
+  key             String    // The actual API key for the provider
+  name            String    @default("Key") // Display name
+  status          String    @default("active") // "active" | "rate_limited" | "disabled" | "quota_exceeded"
+  usageCount      Int       @default(0) // Total requests made with this key
+  dailyUsageCount Int       @default(0) // Daily counter (reset daily)
+  lastUsedAt      DateTime?
+  rateLimitResetAt DateTime? // When the rate limit resets
+  cooldownUntil   DateTime? // Cooldown period before reuse
+  weight          Int       @default(1) // For weighted load balancing
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  provider        Provider  @relation(fields: [providerId], references: [id], onDelete: Cascade)
+  usageLogs       UsageLog[]
+
+  @@map("provider_keys")
+}
+
+// ============================================
+// AI MODELS
+// ============================================
+
+model Model {
+  id                  String    @id @default(cuid())
+  providerId          String
+  name                String    @unique // "deepseek-ai/deepseek-v3.1-terminus"
+  displayName         String    // "DeepSeek V3.1"
+  inputPricePer1k     Float     @default(0) // Price per 1K input tokens (USD)
+  outputPricePer1k    Float     @default(0) // Price per 1K output tokens (USD)
+  maxTokens           Int       @default(4096)
+  status              String    @default("active") // "active" | "inactive"
+  description         String?
+  createdAt           DateTime  @default(now())
+
+  provider            Provider  @relation(fields: [providerId], references: [id], onDelete: Cascade)
+  usageLogs           UsageLog[]
+
+  @@map("models")
+}
+
+// ============================================
+// USAGE LOGGING
+// ============================================
+
+model UsageLog {
+  id              String    @id @default(cuid())
+  userId          String
+  apiKeyId        String?
+  model           String    // Model name used
+  providerId      String?
+  providerKeyId   String?
+  inputTokens     Int       @default(0)
+  outputTokens    Int       @default(0)
+  totalTokens     Int       @default(0)
+  cost            Float     @default(0) // USD cost
+  latencyMs       Int       @default(0) // Response latency in ms
+  status          String    @default("success") // "success" | "error" | "rate_limited" | "timeout"
+  errorMessage    String?
+  requestId       String?   // For tracking
+  createdAt       DateTime  @default(now())
+
+  user            User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  apiKey          ApiKey?   @relation(fields: [apiKeyId], references: [id], onDelete: SetNull)
+  provider        Provider? @relation(fields: [providerId], references: [id], onDelete: SetNull)
+  providerKey     ProviderKey? @relation(fields: [providerKeyId], references: [id], onDelete: SetNull)
+
+  @@index([userId, createdAt])
+  @@index([model, createdAt])
+  @@index([providerId, createdAt])
+  @@map("usage_logs")
+}
+
+// ============================================
+// BILLING
+// ============================================
+
+model BillingTransaction {
+  id              String    @id @default(cuid())
+  userId          String
+  amount          Float     // Positive = credit, Negative = debit
+  type            String    // "topup" | "usage" | "refund" | "bonus"
+  description     String?
+  usageLogId      String?   // Link to usage log if type=usage
+  createdAt       DateTime  @default(now())
+
+  user            User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, createdAt])
+  @@map("billing_transactions")
+}
+
+// ============================================
+// SYSTEM SETTINGS (Admin Config)
+// ============================================
+
+model SystemSetting {
+  id        String   @id @default(cuid())
+  key       String   @unique
+  value     String
+  updatedAt DateTime @updatedAt
+
+  @@map("system_settings")
+}
