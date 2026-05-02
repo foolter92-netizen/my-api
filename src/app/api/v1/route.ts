@@ -13,14 +13,13 @@ import { v4 as uuidv4 } from 'uuid';
 
 // ============================================
 // OPENAI-COMPATIBLE CHAT COMPLETIONS ENDPOINT
-// Supports multiple provider formats:
-//   - OpenAI format (bearer auth, /chat/completions)
-//   - YepAPI format (x-api-key auth, /ai/chat)
 // ============================================
 
-// Extend serverless function timeout for long-running streams (up to 5 min)
 export const maxDuration = 300;
 export const dynamic = 'force-dynamic';
+
+// Default max_tokens if client doesn't specify (prevents provider using tiny defaults like 16)
+const DEFAULT_MAX_TOKENS = 8192;
 
 export async function POST(request: NextRequest) {
   const startTime = Date.now();
@@ -106,14 +105,18 @@ export async function POST(request: NextRequest) {
     const outputPrice = pricing?.outputPricePer1m || 0;
 
     // Build request body for provider
+    // IMPORTANT: Set default max_tokens if not specified by client
+    // Some providers default to as low as 16 tokens if not specified!
     const providerRequest: any = {
       model: modelName,
       messages,
       stream: !!stream,
+      max_tokens: max_tokens || DEFAULT_MAX_TOKENS,
     };
     if (temperature !== undefined) providerRequest.temperature = temperature;
-    if (max_tokens !== undefined) providerRequest.max_tokens = max_tokens;
     if (top_p !== undefined) providerRequest.top_p = top_p;
+    // If client explicitly set max_tokens, override the default
+    if (max_tokens !== undefined) providerRequest.max_tokens = max_tokens;
 
     if (stream) {
       return handleStreamRequest(
@@ -164,10 +167,8 @@ function buildProviderRequest(provider: any, providerKeyInfo: any, providerReque
 function transformToOpenAI(data: any, provider: any, modelName: string): any {
   const format = provider.response_format || 'openai';
 
-  // Already OpenAI format
   if (format === 'openai') return data;
 
-  // YepAPI format: { data: { message, usage, model, ... }, ok: true }
   if (format === 'yepapi') {
     const inner = data.data || data;
     const message = inner.message || {};
@@ -252,28 +253,22 @@ async function executeWithFailover(
       body,
     }, provider.timeout_ms || 30000);
 
-    // Handle all non-2xx responses
     if (!response.ok) {
       let errorBody = '';
       try { errorBody = await response.text(); } catch {}
 
-      // Determine if this error should trigger failover
-      // 429 = rate limit, 401 = auth/key expired, 402 = quota/balance exhausted,
-      // 403 = forbidden, 5xx = server error — all should try failover
       const shouldFailover = [429, 401, 402, 403].includes(response.status) || response.status >= 500;
 
       if (shouldFailover) {
-        // Mark key with cooldown based on error type
         if (response.status === 429) {
-          await markKeyStatus(providerKeyInfo.id, 'rate_limited', 60000); // 60s cooldown
+          await markKeyStatus(providerKeyInfo.id, 'rate_limited', 60000);
         } else if (response.status === 401 || response.status === 402) {
-          await markKeyStatus(providerKeyInfo.id, 'rate_limited', 300000); // 5min — key likely dead
+          await markKeyStatus(providerKeyInfo.id, 'rate_limited', 300000);
         } else {
-          await markKeyStatus(providerKeyInfo.id, 'rate_limited', 30000); // 30s cooldown
+          await markKeyStatus(providerKeyInfo.id, 'rate_limited', 30000);
         }
 
         if (attemptCount < (provider.retry_attempts || 3)) {
-          // STEP 1: Try another key from the SAME provider first
           const sameProviderKey = await getNextKeyFromSameProvider(provider.id, providerKeyInfo.id);
           if (sameProviderKey) {
             console.log(`[Failover] ${provider.name} key failed (${response.status}), trying next key from same provider`);
@@ -283,7 +278,6 @@ async function executeWithFailover(
             );
           }
 
-          // STEP 2: No more keys in same provider, try a DIFFERENT provider
           const failover = await getFailoverProviderAndKey(provider.id, modelName);
           if (failover) {
             console.log(`[Failover] No more keys in ${provider.name}, switching to ${failover.provider.name}`);
@@ -295,21 +289,16 @@ async function executeWithFailover(
         }
       }
 
-      // No failover available or max attempts reached — return error to user
-      // Parse error for better message
       let errorMsg = errorBody;
       try {
         const parsed = JSON.parse(errorBody);
         errorMsg = parsed.error?.message || parsed.message || parsed.error?.type || errorBody;
       } catch {}
 
-      if (!errorMsg) {
-        errorMsg = `Provider returned HTTP ${response.status}`;
-      }
+      if (!errorMsg) errorMsg = `Provider returned HTTP ${response.status}`;
 
       console.error(`Provider error [${response.status}]: ${provider.name} - ${errorMsg}`);
 
-      // Log the failed request
       await logUsage({
         userId, apiKeyId: apiKeyId || undefined, model: modelName,
         providerId: provider.id, providerKeyId: providerKeyInfo.id,
@@ -326,16 +315,11 @@ async function executeWithFailover(
 
     const rawData = await response.json();
     const latencyMs = Date.now() - startTime;
-
-    // Extract tokens from provider-specific format
     const tokens = extractTokens(rawData, provider);
-
     const cost = calculateCost(tokens.inputTokens, tokens.outputTokens, inputPrice, outputPrice);
 
-    // Update key usage
     await incrementKeyUsage(providerKeyInfo.id);
 
-    // Log usage
     await logUsage({
       userId,
       apiKeyId: apiKeyId || undefined,
@@ -351,7 +335,6 @@ async function executeWithFailover(
       requestId,
     });
 
-    // Transform response to OpenAI format for the user
     const openaiData = transformToOpenAI(rawData, provider, modelName);
 
     return NextResponse.json(openaiData, {
@@ -367,7 +350,6 @@ async function executeWithFailover(
       await markKeyStatus(providerKeyInfo.id, 'rate_limited', 30000);
 
       if (attemptCount < (provider.retry_attempts || 3)) {
-        // STEP 1: Try another key from the SAME provider first
         const sameProviderKey = await getNextKeyFromSameProvider(provider.id, providerKeyInfo.id);
         if (sameProviderKey) {
           console.log(`[Failover] ${provider.name} key timed out, trying next key from same provider`);
@@ -377,7 +359,6 @@ async function executeWithFailover(
           );
         }
 
-        // STEP 2: No more keys, try different provider
         const failover = await getFailoverProviderAndKey(provider.id, modelName);
         if (failover) {
           console.log(`[Failover] No more keys in ${provider.name} (timeout), switching to ${failover.provider.name}`);
@@ -405,11 +386,17 @@ async function executeWithFailover(
 }
 
 // ============================================
-// STREAMING HANDLER (Robust SSE Proxy)
+// STREAMING HANDLER
+// ============================================
+// Key fixes:
+// 1. NO AbortController on the stream fetch (prevents signal from killing body)
+// 2. Connection timeout via race pattern (disconnects from body stream)
+// 3. Default max_tokens prevents tiny provider defaults
+// 4. Direct body passthrough with TransformStream for analysis
 // ============================================
 
-const STREAM_CONNECTION_TIMEOUT = 120000; // 2 minutes for initial connection
 const MAX_STREAM_ATTEMPTS = 3;
+const CONNECTION_TIMEOUT_MS = 120000; // 2 min to first byte
 
 async function handleStreamRequest(
   provider: any, providerKeyInfo: any, providerRequest: any,
@@ -420,40 +407,39 @@ async function handleStreamRequest(
   try {
     const { url, headers, body } = buildProviderRequest(provider, providerKeyInfo, { ...providerRequest, stream: true });
 
-    console.log(`[Stream] -> ${provider.name} ${url} model=${modelName} attempt=${attemptCount}`);
+    console.log(`[Stream] -> ${provider.name} ${url} model=${modelName} max_tokens=${providerRequest.max_tokens} attempt=${attemptCount}`);
 
-    // Use longer timeout for streaming initial connection
-    const response = await fetchWithTimeout(url, {
-      method: 'POST',
-      headers,
-      body,
-    }, provider.timeout_ms || STREAM_CONNECTION_TIMEOUT);
+    // CRITICAL FIX: Use plain fetch WITHOUT AbortController for streaming
+    // AbortController signal stays attached to the body stream and can
+    // prematurely close it even after headers arrive
+    const connectionTimeoutMs = provider.timeout_ms || CONNECTION_TIMEOUT_MS;
 
-    // Handle error responses with failover
-    if (!response.ok) {
-      const shouldFailover = [429, 401, 402, 403].includes(response.status) || response.status >= 500;
+    let response: Response;
+    try {
+      // Race: connection timeout vs actual fetch
+      // Once headers arrive, the timeout is irrelevant and the body streams freely
+      response = await Promise.race([
+        fetch(url, { method: 'POST', headers, body }),
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error('Connection timeout')), connectionTimeoutMs)
+        ),
+      ]);
+    } catch (fetchError: any) {
+      // Connection failed or timed out — try failover
+      console.error(`[Stream] Connection error: ${fetchError.message}`);
 
-      if (shouldFailover && attemptCount < MAX_STREAM_ATTEMPTS) {
-        // Mark key with cooldown
-        if (response.status === 401 || response.status === 402) {
-          await markKeyStatus(providerKeyInfo.id, 'rate_limited', 300000);
-        } else if (response.status === 429) {
-          await markKeyStatus(providerKeyInfo.id, 'rate_limited', 60000);
-        } else {
-          await markKeyStatus(providerKeyInfo.id, 'rate_limited', 30000);
-        }
+      if (attemptCount < MAX_STREAM_ATTEMPTS) {
+        await markKeyStatus(providerKeyInfo.id, 'rate_limited', 30000);
 
-        // STEP 1: Try another key from same provider
         const sameProviderKey = await getNextKeyFromSameProvider(provider.id, providerKeyInfo.id);
         if (sameProviderKey) {
-          console.log(`[Stream Failover] ${provider.name} key failed (${response.status}), trying next key from same provider`);
+          console.log(`[Stream Failover] ${provider.name} connection failed, trying next key from same provider`);
           return handleStreamRequest(
             provider, sameProviderKey, providerRequest,
             userId, apiKeyId, modelName, inputPrice, outputPrice, startTime, requestId, attemptCount + 1
           );
         }
 
-        // STEP 2: Try a different provider
         const failover = await getFailoverProviderAndKey(provider.id, modelName);
         if (failover) {
           console.log(`[Stream Failover] Switching to ${failover.provider.name}`);
@@ -464,7 +450,52 @@ async function handleStreamRequest(
         }
       }
 
-      // No failover available
+      await logUsage({
+        userId, apiKeyId: apiKeyId || undefined, model: modelName,
+        providerId: provider.id, providerKeyId: providerKeyInfo.id,
+        inputTokens: 0, outputTokens: 0, totalTokens: 0,
+        cost: 0, latencyMs: Date.now() - startTime,
+        status: 'error', errorMessage: fetchError.message, requestId,
+      });
+
+      return NextResponse.json(
+        { error: { message: `Stream connection failed: ${fetchError.message}`, type: 'stream_error' } },
+        { status: 504 }
+      );
+    }
+
+    // Handle error HTTP responses with failover
+    if (!response.ok) {
+      const shouldFailover = [429, 401, 402, 403].includes(response.status) || response.status >= 500;
+
+      if (shouldFailover && attemptCount < MAX_STREAM_ATTEMPTS) {
+        if (response.status === 401 || response.status === 402) {
+          await markKeyStatus(providerKeyInfo.id, 'rate_limited', 300000);
+        } else if (response.status === 429) {
+          await markKeyStatus(providerKeyInfo.id, 'rate_limited', 60000);
+        } else {
+          await markKeyStatus(providerKeyInfo.id, 'rate_limited', 30000);
+        }
+
+        const sameProviderKey = await getNextKeyFromSameProvider(provider.id, providerKeyInfo.id);
+        if (sameProviderKey) {
+          console.log(`[Stream Failover] ${provider.name} key failed (${response.status}), trying next key`);
+          return handleStreamRequest(
+            provider, sameProviderKey, providerRequest,
+            userId, apiKeyId, modelName, inputPrice, outputPrice, startTime, requestId, attemptCount + 1
+          );
+        }
+
+        const failover = await getFailoverProviderAndKey(provider.id, modelName);
+        if (failover) {
+          console.log(`[Stream Failover] Switching to ${failover.provider.name}`);
+          return handleStreamRequest(
+            failover.provider, failover.key, providerRequest,
+            userId, apiKeyId, modelName, inputPrice, outputPrice, startTime, requestId, attemptCount + 1
+          );
+        }
+      }
+
       let errorBody = '';
       try { errorBody = await response.text(); } catch {}
 
@@ -489,39 +520,17 @@ async function handleStreamRequest(
       );
     }
 
-    // Calculate input tokens before starting stream
+    // Calculate input tokens
     const inputTokens = estimateTokens(JSON.stringify(providerRequest.messages));
 
-    // Create robust streaming response with proper SSE handling
+    // Create the streaming response
     return createStreamingResponse(
       response, provider, providerKeyInfo,
       userId, apiKeyId, modelName,
       inputPrice, outputPrice, inputTokens, startTime, requestId
     );
   } catch (error: any) {
-    console.error('[Stream] Error:', error);
-
-    if ((error.name === 'AbortError' || error.message?.includes('timeout')) && attemptCount < MAX_STREAM_ATTEMPTS) {
-      await markKeyStatus(providerKeyInfo.id, 'rate_limited', 30000);
-
-      const sameProviderKey = await getNextKeyFromSameProvider(provider.id, providerKeyInfo.id);
-      if (sameProviderKey) {
-        console.log(`[Stream Failover] ${provider.name} timeout, trying next key from same provider`);
-        return handleStreamRequest(
-          provider, sameProviderKey, providerRequest,
-          userId, apiKeyId, modelName, inputPrice, outputPrice, startTime, requestId, attemptCount + 1
-        );
-      }
-
-      const failover = await getFailoverProviderAndKey(provider.id, modelName);
-      if (failover) {
-        console.log(`[Stream Failover] Switching to ${failover.provider.name} after timeout`);
-        return handleStreamRequest(
-          failover.provider, failover.key, providerRequest,
-          userId, apiKeyId, modelName, inputPrice, outputPrice, startTime, requestId, attemptCount + 1
-        );
-      }
-    }
+    console.error('[Stream] Unhandled error:', error);
 
     await logUsage({
       userId, apiKeyId: apiKeyId || undefined, model: modelName,
@@ -540,10 +549,8 @@ async function handleStreamRequest(
 
 // ============================================
 // ROBUST SSE STREAMING RESPONSE
-// - Passes through raw chunks immediately
-// - Detects [DONE] and ensures it's always sent
-// - Counts output tokens for billing
-// - Non-blocking usage logging after stream ends
+// Uses TransformStream to decouple from provider fetch
+// Passes chunks through IMMEDIATELY, analyzes in parallel
 // ============================================
 
 function createStreamingResponse(
@@ -565,84 +572,58 @@ function createStreamingResponse(
   let doneReceived = false;
   let streamErrored = false;
   let partialLine = '';
+  let chunkCount = 0;
 
-  const stream = new ReadableStream({
-    async start(controller) {
+  // Create a TransformStream that passes data through immediately
+  // while also analyzing it for token counting and [DONE] detection
+  const transform = new TransformStream({
+    transform(chunk, controller) {
+      // Pass through IMMEDIATELY — no buffering, no waiting
+      controller.enqueue(chunk);
+      chunkCount++;
+
+      // Also decode for analysis (lightweight, doesn't block passthrough)
       try {
-        const reader = providerResponse.body!.getReader();
+        partialLine += decoder.decode(chunk, { stream: true });
+        const lines = partialLine.split('\n');
+        partialLine = lines.pop() || '';
 
-        while (true) {
-          const { done, value } = await reader.read();
-
-          if (done) {
-            // Provider finished sending data
-            console.log(`[Stream] Provider ended (DONE received: ${doneReceived}, output tokens: ~${outputTokenCount})`);
-
-            // If stream ended without [DONE], send it ourselves
-            if (!doneReceived) {
-              console.log('[Stream] Provider ended without [DONE], appending it');
-              controller.enqueue(encoder.encode('data: [DONE]\n\n'));
-            }
-            controller.close();
-            break;
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (trimmed === 'data: [DONE]') {
+            doneReceived = true;
+            continue;
           }
-
-          // Pass through raw chunk to client IMMEDIATELY (no delay)
-          controller.enqueue(value);
-
-          // Also decode for analysis (token counting, [DONE] detection)
-          partialLine += decoder.decode(value, { stream: true });
-
-          // Process complete lines for analysis only
-          const lines = partialLine.split('\n');
-          partialLine = lines.pop() || '';
-
-          for (const line of lines) {
-            const trimmedLine = line.trim();
-
-            // Detect [DONE] marker
-            if (trimmedLine === 'data: [DONE]') {
-              doneReceived = true;
-              continue;
-            }
-
-            // Try to extract token count from data lines
-            const dataMatch = trimmedLine.match(/^data:\s*(.+)$/);
-            if (dataMatch && dataMatch[1] !== '[DONE]') {
-              try {
-                const parsed = JSON.parse(dataMatch[1]);
-                const content = parsed.choices?.[0]?.delta?.content || '';
-                if (content) {
-                  outputTokenCount += Math.ceil(content.length / 4);
-                }
-                // Use exact token count from provider if available in final chunk
-                if (parsed.usage?.completion_tokens) {
-                  outputTokenCount = parsed.usage.completion_tokens;
-                }
-              } catch {}
-            }
+          const m = trimmed.match(/^data:\s*(.+)$/);
+          if (m && m[1] !== '[DONE]') {
+            try {
+              const parsed = JSON.parse(m[1]);
+              const content = parsed.choices?.[0]?.delta?.content || '';
+              if (content) outputTokenCount += Math.ceil(content.length / 4);
+              if (parsed.usage?.completion_tokens) outputTokenCount = parsed.usage.completion_tokens;
+            } catch {}
           }
         }
-      } catch (error: any) {
-        streamErrored = true;
-        console.error('[Stream] Error reading from provider:', error?.message || error);
+      } catch {}
+    },
 
-        // Ensure [DONE] is sent even on error
-        if (!doneReceived) {
-          try {
-            controller.enqueue(encoder.encode('data: [DONE]\n\n'));
-          } catch {}
-        }
-
-        try { controller.close(); } catch {}
+    flush(controller) {
+      // Stream ended — ensure [DONE] is always sent
+      if (!doneReceived) {
+        console.log('[Stream] Provider ended without [DONE], appending it');
+        try {
+          controller.enqueue(encoder.encode('data: [DONE]\n\n'));
+        } catch {}
       }
 
-      // Non-blocking usage logging (after stream ends, don't block the response)
+      console.log(`[Stream] Complete: ${chunkCount} chunks, ~${outputTokenCount} output tokens, DONE=${doneReceived}`);
+
+      // Non-blocking usage logging
       const latencyMs = Date.now() - startTime;
       const cost = calculateCost(inputTokens, outputTokenCount, inputPrice, outputPrice);
 
       incrementKeyUsage(providerKeyInfo.id).catch(e =>
-        console.error('[Stream] Key usage log error:', e?.message || e)
+        console.error('[Stream] Key usage log error:', e?.message)
       );
 
       logUsage({
@@ -659,20 +640,18 @@ function createStreamingResponse(
         status: streamErrored ? 'error' : 'success',
         requestId,
       }).catch(e =>
-        console.error('[Stream] Usage log error:', e?.message || e)
+        console.error('[Stream] Usage log error:', e?.message)
       );
-    },
-
-    cancel() {
-      console.log('[Stream] Client disconnected');
     },
   });
 
-  return new Response(stream, {
+  // Pipe provider response through our transform
+  const processedStream = providerResponse.body!.pipeThrough(transform);
+
+  return new Response(processedStream, {
     headers: {
       'Content-Type': 'text/event-stream',
       'Cache-Control': 'no-cache, no-transform',
-      'Connection': 'keep-alive',
       'X-Accel-Buffering': 'no',
       'X-Request-Id': requestId,
       'X-Provider': provider.name,
@@ -684,8 +663,7 @@ function createStreamingResponse(
 // UTILITIES
 // ============================================
 
-// Timeout only applies to initial connection (headers).
-// Once headers arrive, clearTimeout is called and the stream body flows indefinitely.
+// Only used for non-streaming requests
 function fetchWithTimeout(url: string, options: any, timeoutMs: number): Promise<Response> {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
