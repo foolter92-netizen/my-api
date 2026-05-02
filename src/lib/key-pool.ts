@@ -48,16 +48,30 @@ export async function refreshCache() {
     const providersResult = await query('providers', { filter: { status: 'active' } });
     providerCache = providersResult.rows.sort((a: any, b: any) => a.priority - b.priority);
 
-    // Load active keys per provider (not rate limited, not cooled down)
-    const allKeysResult = await query('provider_keys', { filter: { status: 'active' } });
-    const allKeys = allKeysResult.rows;
+    // Load ALL keys (active + rate_limited) — we'll filter by cooldown below
+    // This fixes the bug where rate_limited keys never recover to active
+    const activeKeysResult = await query('provider_keys', { filter: { status: 'active' } });
+    const rateLimitedKeysResult = await query('provider_keys', { filter: { status: 'rate_limited' } });
+    const allKeys = [...activeKeysResult.rows, ...rateLimitedKeysResult.rows];
+
+    // Auto-recover keys whose cooldown has expired
+    for (const key of rateLimitedKeysResult.rows) {
+      const cooldownExpired = !key.cooldown_until || new Date(key.cooldown_until) <= new Date();
+      const rateLimitExpired = !key.rate_limit_reset_at || new Date(key.rate_limit_reset_at) <= new Date();
+      if (cooldownExpired && rateLimitExpired) {
+        // Reset key back to active status
+        await update('provider_keys', { status: 'active' }, { id: key.id });
+        key.status = 'active';
+      }
+    }
 
     const newKeyPool = new Map<string, ProviderKeyInfo[]>();
     for (const provider of providerCache) {
       const providerKeys = allKeys
         .filter((k: any) => {
           if (k.provider_id !== provider.id) return false;
-          // Filter out keys in cooldown or rate limited
+          if (k.status !== 'active') return false; // Still in cooldown
+          // Double-check cooldown hasn't expired
           if (k.cooldown_until && new Date(k.cooldown_until) > new Date()) return false;
           if (k.rate_limit_reset_at && new Date(k.rate_limit_reset_at) > new Date()) return false;
           return true;
