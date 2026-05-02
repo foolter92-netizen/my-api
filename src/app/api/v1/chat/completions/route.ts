@@ -127,6 +127,13 @@ export async function POST(request: NextRequest) {
 
     if (temperature !== undefined) providerRequest.temperature = temperature;
     if (top_p !== undefined) providerRequest.top_p = top_p;
+    // Pass through additional parameters that providers may support
+    const { frequency_penalty, presence_penalty, stop } = body;
+    if (frequency_penalty !== undefined) providerRequest.frequency_penalty = frequency_penalty;
+    if (presence_penalty !== undefined) providerRequest.presence_penalty = presence_penalty;
+    if (stop !== undefined) providerRequest.stop = stop;
+    // Also pass stream_options for providers that support it (e.g. for usage in streaming)
+    if (body.stream_options !== undefined) providerRequest.stream_options = body.stream_options;
 
     if (stream) {
       return handleStreamRequest(
@@ -150,7 +157,22 @@ export async function POST(request: NextRequest) {
 
 // ============================================
 // BUILD PROVIDER-SPECIFIC REQUEST
+// Filters parameters to only send what the provider supports
+// Prevents validation errors from unknown parameters
 // ============================================
+
+// Parameters supported by YepAPI (based on docs)
+const YEPAPI_SUPPORTED_PARAMS = new Set([
+  'model', 'messages', 'max_tokens', 'temperature', 'top_p',
+  'frequency_penalty', 'presence_penalty', 'stop', 'stream',
+]);
+
+// Parameters supported by standard OpenAI-compatible providers
+const OPENAI_SUPPORTED_PARAMS = new Set([
+  'model', 'messages', 'max_tokens', 'max_completion_tokens', 'temperature', 'top_p',
+  'frequency_penalty', 'presence_penalty', 'stop', 'stream', 'stream_options',
+  'response_format', 'seed', 'tools', 'tool_choice', 'n', 'logprobs', 'top_logprobs',
+]);
 
 function buildProviderRequest(provider: any, providerKeyInfo: any, providerRequest: any) {
   const chatPath = provider.chat_path || '/chat/completions';
@@ -167,7 +189,30 @@ function buildProviderRequest(provider: any, providerKeyInfo: any, providerReque
     headers['Authorization'] = `Bearer ${providerKeyInfo.key}`;
   }
 
-  return { url, headers, body: JSON.stringify(providerRequest) };
+  // Filter request body to only include parameters the provider understands
+  // Use auth_type as indicator: 'api_key' providers (like YepAPI) have limited params
+  // Use response_format='yepapi' as another indicator
+  // This prevents sending max_completion_tokens/stream_options to providers that reject unknown params
+  const isYepApiStyle = provider.auth_type === 'api_key' || provider.response_format === 'yepapi';
+  const supportedParams = isYepApiStyle ? YEPAPI_SUPPORTED_PARAMS : OPENAI_SUPPORTED_PARAMS;
+
+  const filteredRequest: any = {};
+  for (const [key, value] of Object.entries(providerRequest)) {
+    if (supportedParams.has(key)) {
+      filteredRequest[key] = value;
+    }
+  }
+
+  // ALWAYS ensure max_tokens is set (even if client only sent max_completion_tokens)
+  // This prevents providers that don't understand max_completion_tokens
+  // from using their default (which can be as low as 16 tokens)
+  if (!filteredRequest.max_tokens && providerRequest.max_completion_tokens) {
+    filteredRequest.max_tokens = providerRequest.max_completion_tokens;
+  }
+
+  console.log(`[BuildRequest] ${provider.name} params: ${Object.keys(filteredRequest).join(', ')} max_tokens=${filteredRequest.max_tokens}`);
+
+  return { url, headers, body: JSON.stringify(filteredRequest) };
 }
 
 // ============================================
