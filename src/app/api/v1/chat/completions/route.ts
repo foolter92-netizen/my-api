@@ -18,8 +18,10 @@ import { v4 as uuidv4 } from 'uuid';
 export const maxDuration = 300;
 export const dynamic = 'force-dynamic';
 
-// Default max_tokens if client doesn't specify (prevents provider using tiny defaults like 16)
-const DEFAULT_MAX_TOKENS = 8192;
+// Default max_tokens if client doesn't specify
+// Must be very high for coding agents that write entire projects
+// Most providers will cap this at the model's actual max anyway
+const DEFAULT_MAX_TOKENS = 131072; // 128K - let the model/provider decide the real limit
 
 export async function POST(request: NextRequest) {
   const startTime = Date.now();
@@ -72,7 +74,7 @@ export async function POST(request: NextRequest) {
     }
 
     const body = await request.json();
-    const { model: requestedModel, messages, stream, temperature, max_tokens, top_p } = body;
+    const { model: requestedModel, messages, stream, temperature, max_tokens, max_completion_tokens, top_p } = body;
 
     if (!requestedModel || !messages || !Array.isArray(messages)) {
       return NextResponse.json(
@@ -105,18 +107,26 @@ export async function POST(request: NextRequest) {
     const outputPrice = pricing?.outputPricePer1m || 0;
 
     // Build request body for provider
-    // IMPORTANT: Set default max_tokens if not specified by client
-    // Some providers default to as low as 16 tokens if not specified!
+    // IMPORTANT: Handle both max_tokens AND max_completion_tokens
+    // - max_tokens: older OpenAI parameter
+    // - max_completion_tokens: newer OpenAI parameter (used by OpenClaw and newer clients)
+    // Some providers default to as low as 16 tokens if neither is specified!
+    const effectiveMaxTokens = max_completion_tokens || max_tokens || DEFAULT_MAX_TOKENS;
     const providerRequest: any = {
       model: modelName,
       messages,
       stream: !!stream,
-      max_tokens: max_tokens || DEFAULT_MAX_TOKENS,
     };
+
+    // Send BOTH parameters so providers that support either one will work
+    // Most providers will just ignore the one they don't recognize
+    providerRequest.max_tokens = effectiveMaxTokens;
+    if (max_completion_tokens) {
+      providerRequest.max_completion_tokens = max_completion_tokens;
+    }
+
     if (temperature !== undefined) providerRequest.temperature = temperature;
     if (top_p !== undefined) providerRequest.top_p = top_p;
-    // If client explicitly set max_tokens, override the default
-    if (max_tokens !== undefined) providerRequest.max_tokens = max_tokens;
 
     if (stream) {
       return handleStreamRequest(
