@@ -29,9 +29,13 @@ export function SettingsPanel() {
     return "";
   }, []);
 
-  // Replace YOUR_DOMAIN placeholder with the actual domain in code examples
+  // Replace YOUR_DOMAIN placeholder with the actual domain in code examples.
+  // The code templates use "https://YOUR_DOMAIN" — we replace the full
+  // "https://YOUR_DOMAIN" with origin (which already includes https://) to
+  // avoid "https://https://..." double-prefix.
   function fillDomain(code: string): string {
-    return code.replace(/YOUR_DOMAIN/g, origin || "YOUR_DOMAIN");
+    if (!origin) return code;
+    return code.replace(/https:\/\/YOUR_DOMAIN/g, origin);
   }
 
   function copyCode(code: string) {
