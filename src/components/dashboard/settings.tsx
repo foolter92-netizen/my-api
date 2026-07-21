@@ -111,6 +111,39 @@ export function SettingsPanel() {
                 البوابة تدعم كل مسارات chat الشائعة. أرسل الطلب بنفس بنية OpenAI أو المزود،
                 والبوابة توجّهه تلقائياً للمزود الصحيح حسب اسم النموذج.
               </p>
+
+              <div className="rounded-lg border border-blue-500/30 bg-blue-500/5 p-4 text-sm">
+                <div className="font-semibold mb-2 text-blue-600 dark:text-blue-400">
+                  💡 مهم: ضع مسار المزود الصحيح في الإعدادات
+                </div>
+                <p className="text-muted-foreground mb-3">
+                  البوابة تستخدم <b>مسار المزود</b> المُعدّ في لوحة التحكم (تبويب "المسارات")،
+                  وليس مسار العميل. لذلك يجب أن تضيف مسار <code className="bg-muted px-1 rounded font-mono">chat</code> لكل مزود
+                  بالمسار الفعلي الذي يتوقعه المزود:
+                </p>
+                <div className="space-y-1.5 text-xs">
+                  <div className="flex items-center gap-2">
+                    <Badge variant="outline" className="font-mono w-32 justify-center">OpenAI</Badge>
+                    <code className="font-mono">/v1/chat/completions</code>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <Badge variant="outline" className="font-mono w-32 justify-center">yepapi</Badge>
+                    <code className="font-mono">/v1/ai/chat</code>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <Badge variant="outline" className="font-mono w-32 justify-center">kie.ai</Badge>
+                    <code className="font-mono">/{"{model}"}/v1/chat/completions</code>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <Badge variant="outline" className="font-mono w-32 justify-center">v0.dev</Badge>
+                    <code className="font-mono">/v1/chats</code>
+                  </div>
+                </div>
+                <p className="text-muted-foreground mt-3 text-xs">
+                  العميل دائماً يطلب <code className="bg-muted px-1 rounded font-mono">/v1/chat/completions</code> والبوابة
+                  تحوّله تلقائياً لمسار المزود الصحيح. لا حاجة لتعديل الكود.
+                </p>
+              </div>
               <EndpointPaths paths={[
                 "/v1/chat/completions",
                 "/v1/chats",
