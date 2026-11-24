@@ -1,0 +1,906 @@
+     1→import { db } from "@/lib/db";
+     2→import { decrypt, sha256 } from "@/lib/crypto";
+     3→import { detectEndpointType, parseModel, safeParseJson, type EndpointType } from "./detect";
+     4→import { classifyResponse } from "./errors";
+     5→import {
+     6→  openaiToAnthropicRequest,
+     7→  anthropicToOpenAIResponse,
+     8→} from "./translate";
+     9→import {
+    10→  chatToResponsesRequest,
+    11→  responsesToChatResponse,
+    12→} from "./responses-translate";
+    13→import { getCachedProviders, markKeyStateInCache, resetProviderKeysInCache, markKeyInFlight, clearKeyInFlight, isKeyInFlight, type CachedProvider, type CachedKey } from "./cache";
+    14→
+    15→export interface ProxyResult {
+    16→  response: Response;
+    17→  meta: {
+    18→    providerId: string | null;
+    19→    providerKeyId: string | null;
+    20→    providerName: string | null;
+    21→    model: string | null;
+    22→    endpointType: EndpointType;
+    23→    retried: number;
+    24→    success: boolean;
+    25→  };
+    26→}
+    27→
+    28→export interface ProxyError {
+    29→  status: number;
+    30→  message: string;
+    31→  meta: ProxyResult["meta"];
+    32→}
+    33→
+    34→/** HTTP headers we never forward to the upstream provider. */
+    35→const STRIP_REQ_HEADERS = new Set([
+    36→  "host",
+    37→  "connection",
+    38→  "content-length",
+    39→  "cf-connecting-ip",
+    40→  "cf-ipcountry",
+    41→  "cf-ray",
+    42→  "cf-visitor",
+    43→  "x-forwarded-for",
+    44→  "x-forwarded-proto",
+    45→  "x-real-ip",
+    46→  "true-client-ip",
+    47→  "x-vercel-forwarded-for",
+    48→  "x-vercel-proxy-signed",
+    49→  "x-vercel-deployment-url",
+    50→  "x-vercel-id",
+    51→  "x-gateway-token", // our own
+    52→  "anthropic-version", // strip — only for Anthropic providers, not others
+    53→  "anthropic-beta", // strip — only for Anthropic providers
+    54→]);
+    55→
+    56→/** Max bytes of an upstream error body to read for classification. */
+    57→const MAX_ERROR_BODY = 2048;
+    58→
+    59→/**
+    60→ * Main transparent proxy entrypoint.
+    61→ *
+    62→ * Performance design:
+    63→ *  - Provider/key graph is served from an in-memory cache (5s TTL) so routing
+    64→ *    decisions don't hit the DB on the hot path.
+    65→ *  - All DB WRITES (key health update, request log, master-key touch) are
+    66→ *    fire-and-forget — they run in the background and never block the
+    67→ *    request or the next key rotation. This is what makes key switching
+    68→ *    "rocket-fast": a failed key triggers a background write while the
+    69→ *    gateway immediately tries the next key.
+    70→ *  - Error bodies are capped at 2KB so a huge upstream error page can't
+    71→ *    stall classification.
+    72→ *  - Key rotation is a tight CPU loop (filter+sort) over cached data.
+    73→ */
+    74→export async function handleProxyRequest(req: Request): Promise<Response> {
+    75→  const startedAt = Date.now();
+    76→  const method = req.method;
+    77→  const url = new URL(req.url);
+    78→  const path = url.pathname;
+    79→
+    80→  // ── 1. Authenticate via master API key ────────────────────────────
+    81→  const authHeader = req.headers.get("authorization");
+    82→  const xApiKey = req.headers.get("x-api-key");
+    83→  let masterKeyRaw: string | null = null;
+    84→  if (authHeader && /bearer/i.test(authHeader)) {
+    85→    masterKeyRaw = authHeader.replace(/^bearer\s+/i, "").trim();
+    86→  } else if (authHeader) {
+    87→    masterKeyRaw = authHeader.trim();
+    88→  } else if (xApiKey) {
+    89→    masterKeyRaw = xApiKey.trim();
+    90→  }
+    91→
+    92→  const meta: ProxyResult["meta"] = {
+    93→    providerId: null,
+    94→    providerKeyId: null,
+    95→    providerName: null,
+    96→    model: null,
+    97→    endpointType: "custom",
+    98→    retried: 0,
+    99→    success: false,
+   100→  };
+   101→
+   102→  if (!masterKeyRaw) {
+   103→    return jsonError(401, "Missing API key. Send it via Authorization: Bearer <key> or x-api-key.", meta);
+   104→  }
+   105→
+   106→  const masterKey = await db.masterApiKey.findUnique({
+   107→    where: { keyHash: sha256(masterKeyRaw) },
+   108→    select: { id: true, userId: true, isActive: true },
+   109→  });
+   110→  if (!masterKey || !masterKey.isActive) {
+   111→    return jsonError(401, "Invalid or disabled API key.", meta);
+   112→  }
+   113→
+   114→  const userId = masterKey.userId;
+   115→
+   116→  // ── 2. Detect endpoint type ───────────────────────────────────────
+   117→  const detected = detectEndpointType(path);
+   118→  meta.endpointType = detected.type;
+   119→
+   120→  // ── 3. Read & parse body (for model discovery) ────────────────────
+   121→  const bodyBuffer = method !== "GET" && method !== "HEAD" ? await req.arrayBuffer() : null;
+   122→  const bodyText = bodyBuffer ? new TextDecoder().decode(bodyBuffer) : "";
+   123→  const bodyJson = bodyText ? safeParseJson(bodyText) : null;
+   124→  const model = parseModel(bodyJson);
+   125→  meta.model = model;
+   126→
+   127→  // ── 4. Discover candidate providers (from cache — hot path) ───────
+   128→  const providers = await getCachedProviders(userId);
+   129→
+   130→  // Only consider providers that have an endpoint of the requested type.
+   131→  // ALSO include providers with protocol="responses" that have a 'responses'
+   132→  // endpoint (they serve chat requests via translation).
+   133→  const withEndpoint = providers.filter((p) =>
+   134→    p.endpoints.some((e) => e.type === detected.type) ||
+   135→    (p.protocol === "responses" && p.endpoints.some((e) => e.type === "responses"))
+   136→  );
+   137→
+   138→  // Filter by model support: a provider matches if it lists the model OR has
+   139→  // no models configured (wildcard provider).
+   140→  let candidates: CachedProvider[];
+   141→  if (model) {
+   142→    candidates = withEndpoint.filter(
+   143→      (p) => p.models.length === 0 || p.models.some((m) => m.name === model)
+   144→    );
+   145→    if (candidates.length === 0) {
+   146→      // No provider explicitly supports this model — fall back to wildcards
+   147→      // (providers with no models list) which might still accept it.
+   148→      candidates = withEndpoint.filter((p) => p.models.length === 0);
+   149→      if (candidates.length === 0) candidates = withEndpoint;
+   150→    }
+   151→  } else {
+   152→    candidates = withEndpoint;
+   153→  }
+   154→
+   155→  if (candidates.length === 0) {
+   156→    return jsonError(
+   157→      404,
+   158→      model
+   159→        ? `No provider available for model "${model}" on ${detected.type} endpoint.`
+   160→        : `No provider available for ${detected.type} endpoint.`,
+   161→      meta
+   162→    );
+   163→  }
+   164→
+   165→  // ── 5. Iterate providers & keys (rotation + failover) ─────────────
+   166→  // We do up to 3 passes: if all attempts got 5xx (transient provider
+   167→  // errors), retry because the provider may have recovered. Keys are NOT
+   168→  // penalized for 5xx (they stay 'active'), so each pass retries them all.
+   169→  let onlyHad5xxErrors = true;
+   170→  for (let pass = 0; pass < 3; pass++) {
+   171→    const now = Date.now();
+   172→  for (const provider of candidates) {
+   173→    // Determine which endpoint to use. If the provider speaks the Responses
+   174→    // protocol, always use its 'responses' endpoint (the gateway converts
+   175→    // chat completions → responses transparently). Otherwise use the endpoint
+   176→    // matching the client's requested type.
+   177→    let endpoint = provider.endpoints.find((e) => e.type === detected.type);
+   178→    if (provider.protocol === "responses") {
+   179→      endpoint = provider.endpoints.find((e) => e.type === "responses") || endpoint;
+   180→    }
+   181→    if (!endpoint) continue;
+   182→
+   183→    // On pass > 0, force-recover ALL non-disabled keys to 'active' so we
+   184→    // can retry them. 5xx didn't penalize them, but some may have stale
+   185→    // 'error' state from a previous request. Clear it.
+   186→    if (pass > 0) {
+   187→      for (const k of provider.apiKeys) {
+   188→        if (k.isActive && k.status !== "disabled" && k.status !== "exhausted") {
+   189→          k.status = "active";
+   190→          k.cooldownUntil = null;
+   191→        }
+   192→      }
+   193→    }
+   194→
+   195→    // Order keys: usable first (not disabled / not in cooldown / not
+   196→    // in-flight), least errors, least recently used. Disabled and in-flight
+   197→    // keys are skipped entirely so a bad or busy key never wastes a round-trip.
+   198→    const usableKeys = provider.apiKeys
+   199→      .filter((k) => isKeyUsable(k, now) && !isKeyInFlight(k.id))
+   200→      .sort((a, b) => {
+   201→        // Active (healthy) keys first
+   202→        const aHealthy = a.status === "active" ? 0 : 1;
+   203→        const bHealthy = b.status === "active" ? 0 : 1;
+   204→        if (aHealthy !== bHealthy) return aHealthy - bHealthy;
+   205→        // Then least errors
+   206→        if (a.totalErrors !== b.totalErrors) return a.totalErrors - b.totalErrors;
+   207→        // Then least recently used
+   208→        const aUsed = a.lastUsedAt?.getTime() ?? 0;
+   209→        const bUsed = b.lastUsedAt?.getTime() ?? 0;
+   210→        return aUsed - bUsed;
+   211→      });
+   212→
+   213→    if (usableKeys.length === 0) continue;
+   214→
+   215→    for (const key of usableKeys) {
+   216→      // Re-check usability RIGHT BEFORE trying — a concurrent request may
+   217→      // have disabled this key or put it in cooldown while we were iterating.
+   218→      // This double-check is what makes concurrent bursts efficient: we never
+   219→      // waste an HTTP call on a key that was just marked bad by a sibling.
+   220→      if (!isKeyUsable(key, Date.now()) || isKeyInFlight(key.id)) {
+   221→        continue;
+   222→      }
+   223→      meta.retried += 1;
+   224→      // Mark in-flight so concurrent requests skip this key while we try it
+   225→      markKeyInFlight(key.id);
+   226→
+   227→      let decryptedKey: string;
+   228→      try {
+   229→        decryptedKey = decrypt(key.encryptedKey);
+   230→      } catch {
+   231→        clearKeyInFlight(key.id);
+   232→        markKeyBackground(userId, key.id, { action: "disable", reason: "decrypt_failed" });
+   233→        continue;
+   234→      }
+   235→
+   236→      // Build target URL: provider baseUrl + endpoint path + original query
+   237→      const base = provider.baseUrl.replace(/\/+$/, "");
+   238→      let epRaw = endpoint.path.startsWith("/") ? endpoint.path : `/${endpoint.path}`;
+   239→      // ── Dynamic model interpolation ──
+   240→      // Providers like kie.ai embed the model name in the URL path, e.g.
+   241→      //   /{model}/v1/chat/completions  →  /gpt-5-2/v1/chat/completions
+   242→      // If the path contains {model}, substitute it with the actual model.
+   243→      if (epRaw.includes("{model}")) {
+   244→        if (!model) {
+   245→          // Can't resolve the path without a model — skip this key/provider.
+   246→          clearKeyInFlight(key.id);
+   247→          continue;
+   248→        }
+   249→        epRaw = epRaw.replace(/\{model\}/g, encodeURIComponent(model));
+   250→      }
+   251→      const target = new URL(base + epRaw);
+   252→      target.search = url.search;
+   253→
+   254→      // Build forwarded headers (transparent, swap auth only)
+   255→      const fwdHeaders = new Headers();
+   256→      req.headers.forEach((value, name) => {
+   257→        if (!STRIP_REQ_HEADERS.has(name.toLowerCase())) {
+   258→          fwdHeaders.set(name, value);
+   259→        }
+   260→      });
+   261→      // Replace auth with the provider key
+   262→      fwdHeaders.delete("authorization");
+   263→      fwdHeaders.delete("x-api-key");
+   264→      if (provider.authScheme === "bearer" || provider.authScheme === "raw") {
+   265→        if (provider.authHeader.toLowerCase() === "authorization") {
+   266→          fwdHeaders.set(
+   267→            "Authorization",
+   268→            provider.authScheme === "bearer" ? `Bearer ${decryptedKey}` : decryptedKey
+   269→          );
+   270→        } else {
+   271→          fwdHeaders.set(provider.authHeader, decryptedKey);
+   272→        }
+   273→      } else if (provider.authScheme === "x-api-key") {
+   274→        fwdHeaders.set("x-api-key", decryptedKey);
+   275→      } else {
+   276→        fwdHeaders.set(provider.authHeader, decryptedKey);
+   277→      }
+   278→
+   279→      const init: RequestInit = {
+   280→        method,
+   281→        headers: fwdHeaders,
+   282→        redirect: "follow",
+   283→      };
+   284→
+   285→      // ── Protocol translation (optional) ──
+   286→      const isAnthropicProvider = provider.protocol === "anthropic";
+   287→      const isResponsesProvider = provider.protocol === "responses";
+   288→      if (bodyBuffer && method !== "GET" && method !== "HEAD") {
+   289→        if (isAnthropicProvider && bodyJson) {
+   290→          const translated = openaiToAnthropicRequest(bodyJson);
+   291→          init.body = JSON.stringify(translated);
+   292→          if (!fwdHeaders.has("anthropic-version")) {
+   293→            fwdHeaders.set("anthropic-version", "2023-06-01");
+   294→          }
+   295→        } else if (isResponsesProvider && bodyJson) {
+   296→          // Convert Chat Completions (messages) → Responses API (input)
+   297→          const translated = chatToResponsesRequest(bodyJson);
+   298→          init.body = JSON.stringify(translated);
+   299→        } else {
+   300→          init.body = bodyBuffer;
+   301→        }
+   302→      }
+   303→
+   304→      // Provider timeout so a hanging upstream doesn't block rotation.
+   305→      const timeoutMs = Math.min(Math.max(provider.timeoutMs || 120000, 5000), 300000);
+   306→      try {
+   307→        init.signal = AbortSignal.timeout(timeoutMs);
+   308→      } catch {
+   309→        // AbortSignal.timeout may be unavailable in very old runtimes.
+   310→      }
+   311→
+   312→      let upstream: Response;
+   313→      try {
+   314→        upstream = await fetch(target.toString(), init);
+   315→      } catch (err) {
+   316→        // network error / timeout — fire-and-forget the DB write, move on NOW
+   317→        clearKeyInFlight(key.id);
+   318→        const isTimeout =
+   319→          (err as Error).name === "TimeoutError" ||
+   320→          (err as Error).name === "AbortError";
+   321→        markKeyBackground(userId, key.id, {
+   322→          action: "error",
+   323→          reason: isTimeout
+   324→            ? `timeout_${timeoutMs}ms`
+   325→            : `network: ${(err as Error).message}`,
+   326→        });
+   327→        continue;
+   328→      }
+   329→
+   330→      const status = upstream.status;
+   331→
+   332→      // ── Success — stream the raw response back transparently ──
+   333→      if (status >= 200 && status < 300) {
+   334→        clearKeyInFlight(key.id);
+   335→        // Update cache instantly (synchronous) + DB sync (awaited) so the
+   336→        // "active" status persists even on Vercel serverless.
+   337→        markKeyStateInCache(userId, key.id, {
+   338→          status: "active",
+   339→          cooldownUntil: null,
+   340→          lastError: null,
+   341→          lastUsedAt: new Date(),
+   342→        });
+   343→        // ── Reset sibling keys in this provider ──
+   344→        // When one key succeeds, clear the cooldown of OTHER keys in the same
+   345→        // provider so they get retried on the next request (they may have been
+   346→        // put in cooldown by a transient error). This prevents a provider from
+   347→        // being "locked out" just because one key had a temporary hiccup.
+   348→        resetProviderKeysInCache(userId, provider.id, key.id);
+   349→        meta.providerId = provider.id;
+   350→        meta.providerKeyId = key.id;
+   351→        meta.providerName = provider.name;
+   352→        meta.success = true;
+   353→
+   354→        const respHeaders = new Headers(upstream.headers);
+   355→        respHeaders.delete("content-encoding");
+   356→        respHeaders.delete("content-length");
+   357→        respHeaders.delete("transfer-encoding");
+   358→        respHeaders.set("x-gateway-provider", provider.name);
+   359→        respHeaders.set("x-gateway-retries", String(meta.retried));
+   360→
+   361→        logRequestBackground({
+   362→          userId,
+   363→          masterApiKeyId: masterKey.id,
+   364→          providerId: provider.id,
+   365→          providerKeyId: key.id,
+   366→          providerName: provider.name,
+   367→          model,
+   368→          endpointType: detected.type,
+   369→          method,
+   370→          path,
+   371→          statusCode: status,
+   372→          durationMs: Date.now() - startedAt,
+   373→          requestSize: bodyBuffer?.byteLength ?? 0,
+   374→          success: true,
+   375→          retried: meta.retried - 1,
+   376→        });
+   377→        touchMasterKeyBackground(masterKey.id);
+   378→
+   379→        // ── AWAIT the success DB write before returning ──
+   380→        // On Vercel serverless, fire-and-forget writes are dropped when the
+   381→        // function exits after returning. We MUST await this so the key's
+   382→        // "active" status persists to DB — otherwise the dashboard shows the
+   383→        // key stuck in its previous bad state (rate_limited/error) forever.
+   384→        await markKeySuccessSync(key.id, provider.id);
+   385→
+   386→        // ── Protocol translation: Anthropic response → OpenAI ──
+   387→        if (isAnthropicProvider) {
+   388→          const isStream = /text\/event-stream/i.test(
+   389→            upstream.headers.get("content-type") || ""
+   390→          );
+   391→          if (isStream) {
+   392→            const streamState = { model: model || "unknown", started: false };
+   393→            const transformed = translateAnthropicStream(upstream.body, streamState);
+   394→            respHeaders.set("content-type", "text/event-stream");
+   395→            respHeaders.set("cache-control", "no-cache");
+   396→            return new Response(transformed, {
+   397→              status,
+   398→              statusText: upstream.statusText,
+   399→              headers: respHeaders,
+   400→            });
+   401→          } else {
+   402→            const respText = await upstream.text();
+   403→            const respJson = safeParseJson(respText);
+   404→            const translated = anthropicToOpenAIResponse(respJson);
+   405→            return new Response(JSON.stringify(translated), {
+   406→              status,
+   407→              statusText: upstream.statusText,
+   408→              headers: respHeaders,
+   409→            });
+   410→          }
+   411→        }
+   412→
+   413→        // ── Protocol translation: Responses API → Chat Completions ──
+   414→        if (isResponsesProvider) {
+   415→          const respText = await upstream.text();
+   416→          const respJson = safeParseJson(respText);
+   417→          const translated = responsesToChatResponse(respJson);
+   418→          respHeaders.set("content-type", "application/json");
+   419→          return new Response(JSON.stringify(translated), {
+   420→            status,
+   421→            statusText: upstream.statusText,
+   422→            headers: respHeaders,
+   423→          });
+   424→        }
+   425→
+   426→        return new Response(upstream.body, {
+   427→          status,
+   428→          statusText: upstream.statusText,
+   429→          headers: respHeaders,
+   430→        });
+   431→      }
+   432→
+   433→      // ── Error — read up to 2KB of body for classification (capped) ──
+   434→      const errText = await readCapped(upstream, MAX_ERROR_BODY);
+   435→      const verdict = classifyResponse(status, errText);
+   436→
+   437→      // Clear in-flight marker (request finished with this key)
+   438→      clearKeyInFlight(key.id);
+   439→
+   440→      // ── "retry" (5xx): DON'T penalize the key at all ──
+   441→      // 503/502/504 means the provider was briefly overloaded — the KEY is
+   442→      // fine. We just rotate to the next key WITHOUT changing this key's
+   443→      // status. It stays 'active' and is immediately reusable. This prevents
+   444→      // "all keys exhausted" when the provider has transient 5xx hiccups.
+   445→      if (verdict.action === "retry") {
+   446→        // Only log the error count (for stats), don't change status/cooldown
+   447→        markKeyBackground(userId, key.id, {
+   448→          action: "retry",
+   449→          reason: verdict.reason,
+   450→          statusCode: status,
+   451→        });
+   452→        // Track that we had 5xx (for the retry-pass logic)
+   453→        // (onlyHad5xxErrors stays true)
+   454→        continue; // try next key immediately
+   455→      } else {
+   456→        // Any non-5xx error means we shouldn't do a full retry pass
+   457→        onlyHad5xxErrors = false;
+   458→      }
+   459→
+   460→      // For all other error actions, fire-and-forget the key health update
+   461→      markKeyBackground(userId, key.id, {
+   462→        action: verdict.action,
+   463→        reason: verdict.reason,
+   464→        statusCode: status,
+   465→      });
+   466→
+   467→      // ── Quota exhausted: skip to next PROVIDER (not just next key) ──
+   468→      if (verdict.action === "quota_exhausted") {
+   469→        break; // break out of the key loop → move to next provider
+   470→      }
+   471→
+   472→      // If it's a client error that isn't the key's fault, return it to the
+   473→      // client immediately (transparent behaviour — don't silently retry).
+   474→      if (verdict.action === "ignore") {
+   475→        meta.providerId = provider.id;
+   476→        meta.providerKeyId = key.id;
+   477→        meta.providerName = provider.name;
+   478→        logRequestBackground({
+   479→          userId,
+   480→          masterApiKeyId: masterKey.id,
+   481→          providerId: provider.id,
+   482→          providerKeyId: key.id,
+   483→          providerName: provider.name,
+   484→          model,
+   485→          endpointType: detected.type,
+   486→          method,
+   487→          path,
+   488→          statusCode: status,
+   489→          durationMs: Date.now() - startedAt,
+   490→          requestSize: bodyBuffer?.byteLength ?? 0,
+   491→          success: false,
+   492→          retried: meta.retried - 1,
+   493→          error: `client_${status}`,
+   494→        });
+   495→        touchMasterKeyBackground(masterKey.id);
+   496→        return new Response(errText, {
+   497→          status,
+   498→          statusText: upstream.statusText,
+   499→          headers: cleanRespHeaders(upstream.headers),
+   500→        });
+   501→      }
+   502→
+   503→      // Otherwise rotate to next key / provider immediately (DB writes are
+   504→      // already firing in the background — no waiting).
+   505→      continue;
+   506→    }
+   507→  }
+   508→
+   509→  // ── 6. All keys/providers exhausted ───────────────────────────────
+   510→  // If we only had 5xx errors AND this was pass 0 or 1, retry.
+   511→  // 5xx is transient — the provider may have recovered between passes.
+   512→  if (onlyHad5xxErrors && pass < 2 && meta.retried > 0) {
+   513→    continue; // do another pass
+   514→  }
+   515→  break; // no more passes
+   516→  } // end for pass
+   517→  logRequestBackground({
+   518→    userId,
+   519→    masterApiKeyId: masterKey.id,
+   520→    providerId: meta.providerId,
+   521→    providerKeyId: meta.providerKeyId,
+   522→    providerName: meta.providerName,
+   523→    model,
+   524→    endpointType: detected.type,
+   525→    method,
+   526→    path,
+   527→    statusCode: 502,
+   528→    durationMs: Date.now() - startedAt,
+   529→    requestSize: bodyBuffer?.byteLength ?? 0,
+   530→    success: false,
+   531→    retried: meta.retried,
+   532→    error: "all_keys_exhausted",
+   533→  });
+   534→  touchMasterKeyBackground(masterKey.id);
+   535→  return jsonError(
+   536→    502,
+   537→    `All provider keys exhausted for ${detected.type}${model ? ` / ${model}` : ""}. ${meta.retried} attempt(s) made.`,
+   538→    meta
+   539→  );
+   540→}
+   541→
+   542→// ───────────────────────── helpers ─────────────────────────
+   543→
+   544→/** A key is usable if it's active AND (healthy OR its cooldown has expired). */
+   545→function isKeyUsable(k: CachedKey, now: number): boolean {
+   546→  if (!k.isActive) return false;
+   547→  if (k.status === "active") return true;
+   548→  if (k.status === "disabled" || k.status === "exhausted") return false;
+   549→  // rate_limited / error → usable if cooldown expired
+   550→  if (k.cooldownUntil && k.cooldownUntil.getTime() < now) {
+   551→    // Auto-recover: clear the stale cooldown in-memory so the dashboard
+   552→    // and subsequent requests see this key as healthy.
+   553→    k.status = "active";
+   554→    k.cooldownUntil = null;
+   555→    return true;
+   556→  }
+   557→  return false;
+   558→}
+   559→
+   560→/** Read at most `maxBytes` from a response body as text. Prevents huge error
+   561→ *  pages from stalling classification. */
+   562→async function readCapped(res: Response, maxBytes: number): Promise<string> {
+   563→  try {
+   564→    const reader = res.body?.getReader();
+   565→    if (!reader) {
+   566→      // No streaming body — fall back to text()
+   567→      const t = await res.text();
+   568→      return t.length > maxBytes ? t.slice(0, maxBytes) : t;
+   569→    }
+   570→    const decoder = new TextDecoder();
+   571→    let out = "";
+   572→    let read = 0;
+   573→    while (read < maxBytes) {
+   574→      const { done, value } = await reader.read();
+   575→      if (done) break;
+   576→      out += decoder.decode(value, { stream: true });
+   577→      read += value?.byteLength ?? 0;
+   578→    }
+   579→    return out;
+   580→  } catch {
+   581→    return "";
+   582→  }
+   583→}
+   584→
+   585→function jsonError(status: number, message: string, meta: ProxyResult["meta"]): Response {
+   586→  return Response.json(
+   587→    { error: { message, type: "gateway_error", meta } },
+   588→    { status }
+   589→  );
+   590→}
+   591→
+   592→function cleanRespHeaders(h: Headers): Headers {
+   593→  const out = new Headers(h);
+   594→  out.delete("content-encoding");
+   595→  out.delete("content-length");
+   596→  out.delete("transfer-encoding");
+   597→  return out;
+   598→}
+   599→
+   600→/**
+   601→ * Transform an Anthropic SSE stream into an OpenAI-compatible SSE stream.
+   602→ */
+   603→function translateAnthropicStream(
+   604→  body: ReadableStream<Uint8Array> | null,
+   605→  state: { model: string; started: boolean }
+   606→): ReadableStream<Uint8Array> {
+   607→  const decoder = new TextDecoder();
+   608→  const encoder = new TextEncoder();
+   609→
+   610→  return new ReadableStream({
+   611→    async start(controller) {
+   612→      if (!body) {
+   613→        controller.close();
+   614→        return;
+   615→      }
+   616→      const reader = body.getReader();
+   617→      let buffer = "";
+   618→
+   619→      // Lazy import to avoid circular dependency at module load
+   620→      const { anthropicStreamToOpenAI } = await import("./translate");
+   621→
+   622→      try {
+   623→        while (true) {
+   624→          const { done, value } = await reader.read();
+   625→          if (done) break;
+   626→          buffer += decoder.decode(value, { stream: true });
+   627→
+   628→          const parts = buffer.split("\n\n");
+   629→          buffer = parts.pop() || "";
+   630→
+   631→          for (const part of parts) {
+   632→            const lines = part.split("\n");
+   633→            let evt = "";
+   634→            let dataStr = "";
+   635→            for (const line of lines) {
+   636→              if (line.startsWith("event:")) evt = line.slice(6).trim();
+   637→              else if (line.startsWith("data:")) dataStr += line.slice(5).trim();
+   638→            }
+   639→            if (!evt && !dataStr) continue;
+   640→            let data: unknown = null;
+   641→            if (dataStr) {
+   642→              try {
+   643→                data = JSON.parse(dataStr);
+   644→              } catch {
+   645→                data = dataStr;
+   646→              }
+   647→            }
+   648→            const chunk = anthropicStreamToOpenAI(evt, data, state);
+   649→            if (chunk) {
+   650→              controller.enqueue(encoder.encode(chunk));
+   651→            }
+   652→          }
+   653→        }
+   654→      } catch (err) {
+   655→        controller.error(err);
+   656→        return;
+   657→      }
+   658→      controller.close();
+   659→    },
+   660→  });
+   661→}
+   662→
+   663→// ───────────────────────── Background DB writers (fire-and-forget) ─────────────────────────
+   664→//
+   665→// These never throw into the request path. They run as detached promises so
+   666→// the proxy loop can rotate keys instantly without waiting for any DB write.
+   667→//
+   668→// IMPORTANT (Vercel serverless): fire-and-forget writes may be DROPPED if the
+   669→// function exits immediately after returning the response. For this reason,
+   670→// the SUCCESS path uses markKeySuccessSync() which is AWAITED before the
+   671→// response is returned — ensuring the key's "active" state persists to DB.
+   672→// Error/cooldown writes stay fire-and-forget (losing them is harmless: the
+   673→// cache still has the state, and the next request re-discovers the error).
+   674→
+   675→/**
+   676→ * Synchronous (awaited) key-success DB write.
+   677→ * MUST be awaited before returning the response on serverless — otherwise
+   678→ * Vercel may kill the function and the "active" status never reaches the DB,
+   679→ * leaving the key stuck in a bad state in the dashboard.
+   680→ *
+   681→ * ALSO: recovers sibling keys in the same provider whose cooldown has
+   682→ * expired — sets them back to 'active' so the dashboard reflects reality.
+   683→ */
+   684→async function markKeySuccessSync(keyId: string, providerId: string): Promise<void> {
+   685→  const now = new Date();
+   686→  try {
+   687→    // 1. Mark the succeeded key as active
+   688→    await db.providerApiKey.update({
+   689→      where: { id: keyId },
+   690→      data: {
+   691→        status: "active",
+   692→        cooldownUntil: null,
+   693→        lastError: null,
+   694→        lastUsedAt: now,
+   695→        lastErrorAt: now,
+   696→        totalSuccess: { increment: 1 },
+   697→        totalRequests: { increment: 1 },
+   698→      },
+   699→    });
+   700→    // 2. Recover ALL sibling keys in the same provider that are in a transient
+   701→    //    bad state (error/rate_limited) — regardless of whether their cooldown
+   702→    //    expired. A successful request proves the provider is working, so any
+   703→    //    503/timeout on other keys was transient and should be cleared.
+   704→    //    Only truly disabled keys (401 unauthorized) stay disabled.
+   705→    await db.providerApiKey.updateMany({
+   706→      where: {
+   707→        providerId,
+   708→        isActive: true,
+   709→        status: { in: ["rate_limited", "error"] },
+   710→      },
+   711→      data: { status: "active", cooldownUntil: null, lastError: null },
+   712→    });
+   713→  } catch {
+   714→    // best-effort
+   715→  }
+   716→}
+   717→
+   718→function markKeyBackground(
+   719→  userId: string,
+   720→  keyId: string,
+   721→  opts: { action: string; reason: string; statusCode?: number }
+   722→): void {
+   723→  const now = new Date();
+   724→
+   725→  // ── 1. Update the in-memory cache INSTANTLY (synchronous, no await) ──
+   726→  // This is what makes rotation rocket-fast: the very next request in the
+   727→  // same burst sees the key as disabled/cooldown and skips it without
+   728→  // wasting an HTTP call. Without this, a 5s cache window would re-try
+   729→  // the dead key on every concurrent request.
+   730→  //
+   731→  // SPECIAL: "retry" (5xx) does NOT change the key's status or cooldown —
+   732→  // the key stays 'active' and is immediately reusable. We only increment
+   733→  // the error/request counters for stats.
+   734→  const cooldownMs =
+   735→    opts.action === "quota_exhausted"
+   736→      ? 5 * 60 * 1000 // 5 min — no balance, retry after user tops up
+   737→      : opts.action === "cooldown"
+   738→      ? 30_000 // 30s — rate limit
+   739→      : opts.action === "error"
+   740→      ? 3_000 // 3s — transient
+   741→      : 0;
+   742→
+   743→  const cacheUpdates: Partial<CachedKey> = {
+   744→    lastUsedAt: now,
+   745→  };
+   746→  switch (opts.action) {
+   747→    case "ok":
+   748→      cacheUpdates.status = "active";
+   749→      cacheUpdates.cooldownUntil = null;
+   750→      cacheUpdates.lastError = null;
+   751→      break;
+   752→    case "retry":
+   753→      // DON'T change status, cooldown, or lastError — key is fine!
+   754→      // Just update lastUsedAt (already set above).
+   755→      break;
+   756→    case "disable":
+   757→      cacheUpdates.status = "disabled";
+   758→      cacheUpdates.lastError = opts.reason;
+   759→      cacheUpdates.isActive = false;
+   760→      break;
+   761→    case "quota_exhausted":
+   762→      cacheUpdates.status = "rate_limited"; // status text
+   763→      cacheUpdates.cooldownUntil = new Date(now.getTime() + cooldownMs);
+   764→      cacheUpdates.lastError = `quota_exhausted: ${opts.reason}`;
+   765→      break;
+   766→    case "cooldown":
+   767→      cacheUpdates.status = "rate_limited";
+   768→      cacheUpdates.cooldownUntil = new Date(now.getTime() + cooldownMs);
+   769→      cacheUpdates.lastError = opts.reason;
+   770→      break;
+   771→    case "error":
+   772→      cacheUpdates.status = "error";
+   773→      cacheUpdates.cooldownUntil = new Date(now.getTime() + cooldownMs);
+   774→      cacheUpdates.lastError = opts.reason;
+   775→      break;
+   776→  }
+   777→  markKeyStateInCache(userId, keyId, cacheUpdates);
+   778→
+   779→  // ── 2. Fire the DB write in the background (detached, never blocks) ──
+   780→  void (async () => {
+   781→    const data: Record<string, unknown> = {
+   782→      lastUsedAt: now,
+   783→      lastErrorAt: now,
+   784→    };
+   785→
+   786→    switch (opts.action) {
+   787→      case "ok":
+   788→        data.status = "active";
+   789→        data.cooldownUntil = null;
+   790→        data.totalSuccess = { increment: 1 };
+   791→        data.totalRequests = { increment: 1 };
+   792→        data.lastError = null;
+   793→        break;
+   794→      case "retry":
+   795→        // 5xx: DON'T change status, cooldown, or lastError.
+   796→        // Just count the request + error for stats. Key stays 'active'.
+   797→        data.totalErrors = { increment: 1 };
+   798→        data.totalRequests = { increment: 1 };
+   799→        break;
+   800→      case "disable":
+   801→        data.status = "disabled";
+   802→        data.isActive = false;
+   803→        data.totalErrors = { increment: 1 };
+   804→        data.totalRequests = { increment: 1 };
+   805→        data.lastError = opts.reason;
+   806→        break;
+   807→      case "quota_exhausted":
+   808→        data.status = "rate_limited";
+   809→        data.cooldownUntil = new Date(now.getTime() + cooldownMs);
+   810→        data.totalErrors = { increment: 1 };
+   811→        data.totalRequests = { increment: 1 };
+   812→        data.lastError = `quota_exhausted: ${opts.reason}`;
+   813→        break;
+   814→      case "cooldown":
+   815→        data.status = "rate_limited";
+   816→        data.cooldownUntil = new Date(now.getTime() + cooldownMs);
+   817→        data.totalErrors = { increment: 1 };
+   818→        data.totalRequests = { increment: 1 };
+   819→        data.lastError = opts.reason;
+   820→        break;
+   821→      case "error":
+   822→        data.status = "error";
+   823→        data.totalErrors = { increment: 1 };
+   824→        data.totalRequests = { increment: 1 };
+   825→        data.lastError = opts.reason;
+   826→        data.cooldownUntil = new Date(now.getTime() + cooldownMs);
+   827→        break;
+   828→      default:
+   829→        data.totalRequests = { increment: 1 };
+   830→    }
+   831→
+   832→    try {
+   833→      await db.providerApiKey.update({ where: { id: keyId }, data });
+   834→      await db.keyHealthLog.create({
+   835→        data: {
+   836→          providerKeyId: keyId,
+   837→          event: opts.action,
+   838→          statusCode: opts.statusCode ?? null,
+   839→          message: opts.reason,
+   840→        },
+   841→      });
+   842→    } catch {
+   843→      // best-effort — never break the proxy loop
+   844→    }
+   845→  })();
+   846→}
+   847→
+   848→function touchMasterKeyBackground(id: string): void {
+   849→  void (async () => {
+   850→    try {
+   851→      await db.masterApiKey.update({
+   852→        where: { id },
+   853→        data: { lastUsedAt: new Date() },
+   854→      });
+   855→    } catch {
+   856→      // best-effort
+   857→    }
+   858→  })();
+   859→}
+   860→
+   861→interface LogRequestOpts {
+   862→  userId: string;
+   863→  masterApiKeyId: string;
+   864→  providerId: string | null;
+   865→  providerKeyId: string | null;
+   866→  providerName: string | null;
+   867→  model: string | null;
+   868→  endpointType: EndpointType;
+   869→  method: string;
+   870→  path: string;
+   871→  statusCode: number | null;
+   872→  durationMs: number;
+   873→  requestSize: number;
+   874→  success: boolean;
+   875→  retried: number;
+   876→  error?: string;
+   877→}
+   878→
+   879→function logRequestBackground(opts: LogRequestOpts): void {
+   880→  void (async () => {
+   881→    try {
+   882→      await db.requestLog.create({
+   883→        data: {
+   884→          userId: opts.userId,
+   885→          masterApiKeyId: opts.masterApiKeyId,
+   886→          providerId: opts.providerId,
+   887→          providerKeyId: opts.providerKeyId,
+   888→          providerName: opts.providerName,
+   889→          model: opts.model,
+   890→          endpointType: opts.endpointType,
+   891→          method: opts.method,
+   892→          path: opts.path,
+   893→          statusCode: opts.statusCode,
+   894→          durationMs: opts.durationMs,
+   895→          requestSize: opts.requestSize,
+   896→          success: opts.success,
+   897→          retried: opts.retried,
+   898→          error: opts.error ?? null,
+   899→        },
+   900→      });
+   901→    } catch {
+   902→      // best-effort
+   903→    }
+   904→  })();
+   905→}
+   906→
