@@ -40,7 +40,9 @@ const V0_MODEL_ALIASES: Record<string, string> = {
   "v0": "v0/v0-1.5-md",
   "v0-mini": "v0/v0-1.5-md",
   "v0-md": "v0/v0-1.5-md",
+  "v0-1": "v0/v0-1.5-md",
   "v0-lg": "v0/v0-1.5-lg",
+  "v0-max": "v0/v0-1.5-lg",
 };
 
 /**
