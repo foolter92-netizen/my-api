@@ -10,6 +10,11 @@ import {
   chatToResponsesRequest,
   responsesToChatResponse,
 } from "./responses-translate";
+import {
+  openaiToV0Request,
+  v0ToOpenAIResponse,
+  v0ToOpenAIStreamBody,
+} from "./v0-translate";
 import { getCachedProviders, markKeyStateInCache, resetProviderKeysInCache, markKeyInFlight, clearKeyInFlight, isKeyInFlight, type CachedProvider, type CachedKey } from "./cache";
 
 export interface ProxyResult {
@@ -285,6 +290,7 @@ export async function handleProxyRequest(req: Request): Promise<Response> {
       // ── Protocol translation (optional) ──
       const isAnthropicProvider = provider.protocol === "anthropic";
       const isResponsesProvider = provider.protocol === "responses";
+      const isV0Provider = provider.protocol === "v0";
       if (bodyBuffer && method !== "GET" && method !== "HEAD") {
         if (isAnthropicProvider && bodyJson) {
           const translated = openaiToAnthropicRequest(bodyJson);
@@ -296,6 +302,11 @@ export async function handleProxyRequest(req: Request): Promise<Response> {
           // Convert Chat Completions (messages) → Responses API (input)
           const translated = chatToResponsesRequest(bodyJson);
           init.body = JSON.stringify(translated);
+        } else if (isV0Provider && bodyJson) {
+          // Convert Chat Completions (messages) → v0.dev POST /v1/chats ({ message })
+          const translated = openaiToV0Request(bodyJson);
+          init.body = JSON.stringify(translated);
+          fwdHeaders.set("content-type", "application/json");
         } else {
           init.body = bodyBuffer;
         }
@@ -415,6 +426,33 @@ export async function handleProxyRequest(req: Request): Promise<Response> {
           const respText = await upstream.text();
           const respJson = safeParseJson(respText);
           const translated = responsesToChatResponse(respJson);
+          respHeaders.set("content-type", "application/json");
+          return new Response(JSON.stringify(translated), {
+            status,
+            statusText: upstream.statusText,
+            headers: respHeaders,
+          });
+        }
+
+        // ── Protocol translation: v0.dev chat → Chat Completions ──
+        if (isV0Provider) {
+          const respText = await upstream.text();
+          const respJson = safeParseJson(respText);
+          const translated = v0ToOpenAIResponse(respJson, model);
+          // The v0 API has no SSE streaming — if the client asked for a
+          // stream, emit a synthetic single-chunk OpenAI SSE stream.
+          if (bodyJson && (bodyJson as { stream?: boolean }).stream === true) {
+            const text =
+              (translated as { choices?: Array<{ message?: { content?: string } }> })
+                ?.choices?.[0]?.message?.content ?? "";
+            respHeaders.set("content-type", "text/event-stream");
+            respHeaders.set("cache-control", "no-cache");
+            return new Response(v0ToOpenAIStreamBody(text, model), {
+              status,
+              statusText: upstream.statusText,
+              headers: respHeaders,
+            });
+          }
           respHeaders.set("content-type", "application/json");
           return new Response(JSON.stringify(translated), {
             status,
