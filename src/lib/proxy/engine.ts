@@ -532,9 +532,59 @@ export async function handleProxyRequest(req: Request): Promise<Response> {
     error: "all_keys_exhausted",
   });
   touchMasterKeyBackground(masterKey.id);
+
+  // ── Diagnostic: when NO attempt was made, explain WHY each key was skipped ──
+  // Keys with isActive=false are not even loaded into the cache, so without
+  // this query the user would never know a key was manually turned off.
+  let detail = "";
+  if (meta.retried === 0 && candidates.length > 0) {
+    try {
+      const candIds = candidates.map((c) => c.id);
+      const keys = await db.providerApiKey.findMany({
+        where: { providerId: { in: candIds } },
+        select: {
+          keyPreview: true,
+          isActive: true,
+          status: true,
+          lastError: true,
+          cooldownUntil: true,
+          provider: { select: { name: true } },
+        },
+      });
+      const byProvider = new Map<string, string[]>();
+      const nowMs = Date.now();
+      for (const k of keys) {
+        const pname = k.provider?.name || "provider";
+        let state: string;
+        if (!k.isActive) state = "turned off";
+        else if (k.status === "active") state = "active";
+        else if (k.cooldownUntil && k.cooldownUntil.getTime() > nowMs)
+          state = `${k.status} (cooldown until ${k.cooldownUntil.toISOString().slice(11, 19)}Z)`;
+        else state = k.status;
+        const errPart =
+          k.lastError && k.status !== "active"
+            ? ` — last error: ${String(k.lastError).slice(0, 80)}`
+            : "";
+        const arr = byProvider.get(pname) ?? [];
+        arr.push(`***${k.keyPreview}: ${state}${errPart}`);
+        byProvider.set(pname, arr);
+      }
+      const parts = [...byProvider.entries()].map(
+        ([p, ks]) => `Provider '${p}': ${ks.join("; ")}`
+      );
+      detail = " " + parts.join(" | ").slice(0, 900);
+    } catch {
+      // diagnostics are best-effort — never mask the original error
+    }
+  }
+
+  const hint =
+    meta.retried === 0
+      ? " No key was tried. Open the dashboard → Providers → this provider's keys, and enable/reset a key."
+      : "";
   return jsonError(
     502,
-    `All provider keys exhausted for ${detected.type}${model ? ` / ${model}` : ""}. ${meta.retried} attempt(s) made.`,
+    `All provider keys exhausted for ${detected.type}${model ? ` / ${model}` : ""}. ${meta.retried} attempt(s) made.${detail}${hint}`,
     meta
   );
 }
